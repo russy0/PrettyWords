@@ -50,7 +50,7 @@ SYSTEM_PROMPT = (
     "hate=identity-based hate/discrimination, threat=threats of harm, other=policy violation not covered. "
     "Do not flag benign education, quoting for moderation, reclaimed terms, or clean jokes. "
     "Use custom blocked terms as strong policy, allowed terms as exceptions, and examples as learning context. "
-    "Return only JSON matching the schema. No markdown."
+    "Write the reason field in Korean. Return only JSON matching the schema. No markdown."
 )
 
 BATCH_SYSTEM_PROMPT = (
@@ -61,6 +61,7 @@ BATCH_SYSTEM_PROMPT = (
     "language. Use categories only from this taxonomy: profanity, sexual, family_insult, harassment, hate, "
     "threat, other. Do not flag benign education, quoting for moderation, reclaimed terms, or clean jokes. "
     "Use custom blocked terms as strong policy, allowed terms as exceptions, and examples as learning context. "
+    "Write every reason field in Korean. "
     "Return only JSON matching the schema: an object with a 'decisions' array containing exactly one "
     "decision object per input message, each carrying the same 'index' as its source message so results "
     "can be matched back. No markdown."
@@ -94,7 +95,7 @@ class RateLimitedError(Exception):
     """Raised by a classifier when the provider reports it is being rate limited (HTTP 429)."""
 
     def __init__(self, retry_after: float | None = None, message: str = "") -> None:
-        super().__init__(message or "AI provider rate limited the request")
+        super().__init__(message or "AI 제공자의 요청 제한에 걸렸습니다")
         self.retry_after = retry_after
 
 
@@ -230,7 +231,7 @@ class OllamaClassifier:
         try:
             result = await asyncio.to_thread(self._classify_sync, message, context)
         except Exception as exc:
-            self.last_error = f"{exc.__class__.__name__}: {exc}"
+            self.last_error = f"OpenAI 요청 실패: {exc.__class__.__name__}: {exc}"
             LOGGER.exception("Ollama moderation request failed")
             return None
         if result is not None:
@@ -263,16 +264,16 @@ class OllamaClassifier:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 raw = response.read().decode("utf-8")
         except (TimeoutError, socket.timeout) as exc:
-            self.last_error = f"Ollama timeout after {self.timeout_seconds:.0f}s"
+            self.last_error = f"Ollama 응답 시간 초과: {self.timeout_seconds:.0f}초"
             LOGGER.warning("%s", self.last_error)
             return None
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            self.last_error = f"Ollama HTTP {exc.code}: {detail[:180]}"
+            self.last_error = f"Ollama HTTP 오류 {exc.code}: {detail[:180]}"
             LOGGER.error("%s", self.last_error)
             return None
         except urllib.error.URLError as exc:
-            self.last_error = f"Ollama connection failed: {exc.reason}"
+            self.last_error = f"Ollama 연결 실패: {exc.reason}"
             LOGGER.warning("%s", self.last_error)
             return None
 
@@ -440,27 +441,27 @@ class GroqClassifier:
                         )
                     except Exception:
                         LOGGER.exception("Groq moderation batch request failed after json_object fallback")
-                        self.last_error = "Groq request failed"
+                        self.last_error = "Groq 요청 실패"
                         return [None] * len(messages)
                     self._mark_success(key_index)
                     break
                 LOGGER.error("Groq bad request: %s", exc)
-                self.last_error = f"Groq bad request: {exc}"
+                self.last_error = f"Groq 잘못된 요청: {exc}"
                 return [None] * len(messages)
             except Exception:
                 LOGGER.exception("Groq moderation batch request failed")
-                self.last_error = "Groq request failed"
+                self.last_error = "Groq 요청 실패"
                 return [None] * len(messages)
             else:
                 self._mark_success(key_index)
                 break
 
         if response is None:
-            suffix = f" (retry after {best_retry_after:.0f}s)" if best_retry_after else ""
+            suffix = f" ({best_retry_after:.0f}초 후 재시도)" if best_retry_after else ""
             if self._key_count > 1:
-                self.last_error = f"All {self._key_count} Groq keys rate limited{suffix}"
+                self.last_error = f"Groq 키 {self._key_count}개가 모두 요청 제한에 걸렸습니다{suffix}"
             else:
-                self.last_error = f"Groq rate limited{suffix}"
+                self.last_error = f"Groq 요청 제한에 걸렸습니다{suffix}"
             LOGGER.warning("%s", self.last_error)
             raise RateLimitedError(best_retry_after, self.last_error)
 
@@ -474,7 +475,7 @@ class GroqClassifier:
             raw_decisions = _extract_json_object(content).get("decisions", [])
         except Exception:
             LOGGER.exception("Groq moderation batch response parsing failed")
-            self.last_error = "Groq response parsing failed"
+            self.last_error = "Groq 응답 파싱 실패"
             return [None] * len(messages)
 
         results: list[ModerationDecision | None] = [None] * len(messages)
@@ -491,6 +492,6 @@ class GroqClassifier:
 
         missing = sum(1 for item in results if item is None)
         if missing:
-            self.last_error = f"Groq batch returned {missing}/{len(messages)} missing decisions"
+            self.last_error = f"Groq 배치 응답에서 {missing}/{len(messages)}개 판정 누락"
             LOGGER.warning("%s", self.last_error)
         return results

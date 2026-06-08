@@ -263,7 +263,7 @@ class LocalClassifier:
                     severity=0,
                     categories=("allowlist",),
                     matched_terms=(term,),
-                    reason="Allowed term or phrase matched.",
+                    reason="허용어 또는 허용 문구와 일치했습니다.",
                     source="local",
                 )
 
@@ -282,7 +282,7 @@ class LocalClassifier:
                 violation=False,
                 confidence=0.2,
                 severity=0,
-                reason="No local term match.",
+                reason="로컬 금지어와 일치하지 않았습니다.",
                 source="local",
             )
 
@@ -295,7 +295,7 @@ class LocalClassifier:
             severity=severity,
             categories=categories or ("profanity",),
             matched_terms=tuple(term.term for term in matched[:8]),
-            reason="Blocked term matched after normalization.",
+            reason="정규화 후 금지어와 일치했습니다.",
             source="local",
             suggested_action="timeout" if severity >= 2 else "delete",
         )
@@ -316,7 +316,7 @@ def combine_decisions(
             severity=0,
             categories=tuple(dict.fromkeys((*local.categories, *ai.categories, "ai_context_override"))),
             matched_terms=local.matched_terms,
-            reason=f"AI judged local match as contextual false positive: {ai.reason}",
+            reason=f"AI가 문맥상 오탐으로 판단했습니다: {ai.reason}",
             source="local+ai",
             suggested_action="review",
         )

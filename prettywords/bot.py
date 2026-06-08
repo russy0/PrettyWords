@@ -28,9 +28,53 @@ from .storage import GuildSettings, ModerationStore
 LOGGER = logging.getLogger(__name__)
 MAX_TIMEOUT_MINUTES = 28 * 24 * 60
 CATEGORY_CHOICES = [
-    app_commands.Choice(name=f"{label} ({value})", value=value)
+    app_commands.Choice(name=label, value=value)
     for value, label in CATEGORY_LABELS.items()
 ]
+OUTCOME_LABELS = {
+    "false_positive": "오탐",
+    "confirmed": "정상 제재",
+    "duplicate": "중복",
+    "rejected": "기각",
+}
+ACTION_LABELS = {
+    "dry-run": "모의 실행",
+    "deleted": "메시지 삭제",
+    "already deleted": "이미 삭제됨",
+    "delete failed: missing permission": "삭제 실패: 권한 부족",
+    "delete failed": "삭제 실패",
+    "delete failed: incompatible discord library": "삭제 실패: discord.py 버전 불일치",
+    "logged": "로그만 기록",
+    "timeout failed: missing permission or role hierarchy": "타임아웃 실패: 권한 또는 역할 순서 문제",
+    "timeout failed": "타임아웃 실패",
+}
+SOURCE_LABELS = {
+    "local": "로컬 필터",
+    "ai": "AI",
+    "local+ai": "로컬+AI",
+}
+
+
+def _enabled_label(value: bool) -> str:
+    return "켜짐" if value else "꺼짐"
+
+
+def _source_label(value: str) -> str:
+    return SOURCE_LABELS.get(value, value)
+
+
+def _action_label(action: str) -> str:
+    labels = []
+    for part in (item.strip() for item in action.split(",")):
+        if part.startswith("timeout ") and part.endswith("m"):
+            labels.append(f"타임아웃 {part.removeprefix('timeout ').removesuffix('m')}분")
+        else:
+            labels.append(ACTION_LABELS.get(part, part))
+    return ", ".join(labels)
+
+
+def _outcome_label(value: str) -> str:
+    return OUTCOME_LABELS.get(value, value)
 
 
 def _parse_discord_id(value: str) -> int:
@@ -206,7 +250,7 @@ class PrettyWordsBot(commands.Bot):
     def _ai_label(self, settings: GuildSettings) -> str:
         provider, model, _scan_all = self._effective_ai_settings(settings)
         if provider == "none" or not model:
-            return "none"
+            return "없음"
         return f"{provider}:{model}"
 
     async def setup_hook(self) -> None:
@@ -228,8 +272,8 @@ class PrettyWordsBot(commands.Bot):
 
 
 class ModerationCog(commands.Cog):
-    filter = app_commands.Group(name="filter", description="AI profanity filter settings")
-    admin = app_commands.Group(name="pw", description="PrettyWords bot administration")
+    filter = app_commands.Group(name="filter", description="AI 비속어 필터 설정")
+    admin = app_commands.Group(name="pw", description="PrettyWords 봇 관리")
 
     def __init__(self, bot: PrettyWordsBot) -> None:
         self.bot = bot
@@ -261,7 +305,7 @@ class ModerationCog(commands.Cog):
                 "delete_failures": 0,
                 "timeouts": 0,
                 "timeout_failures": 0,
-                "last_scan": "never",
+                "last_scan": "아직 없음",
                 "last_error": "",
             },
         )
@@ -282,7 +326,7 @@ class ModerationCog(commands.Cog):
             settings = await self.bot.store.get_settings(guild.id)
             if not settings.health_log_enabled or not (settings.health_log_channel_id or settings.log_channel_id):
                 continue
-            await self._send_health_log(guild, settings, title="PrettyWords Health")
+            await self._send_health_log(guild, settings, title="PrettyWords 상태")
 
     @health_heartbeat.before_loop
     async def before_health_heartbeat(self) -> None:
@@ -310,7 +354,7 @@ class ModerationCog(commands.Cog):
         guild: discord.Guild,
         settings: GuildSettings,
         *,
-        title: str = "PrettyWords Health",
+        title: str = "PrettyWords 상태",
     ) -> None:
         channel_id = settings.health_log_channel_id or settings.log_channel_id
         channel = guild.get_channel(channel_id) if channel_id else None
@@ -322,30 +366,30 @@ class ModerationCog(commands.Cog):
         embed = discord.Embed(
             title=title,
             color=discord.Color.green() if not settings.paused else discord.Color.light_grey(),
-            description="Message scanning is running." if not settings.paused else "Filter is paused.",
+            description="메시지 검사가 작동 중입니다." if not settings.paused else "필터가 일시정지되어 있습니다.",
         )
-        embed.add_field(name="AI", value=self.bot._ai_label(settings) if settings.ai_enabled else "disabled", inline=True)
-        embed.add_field(name="AI Scan All", value=str(scan_all), inline=True)
-        embed.add_field(name="Threshold", value=f"{settings.confidence_threshold:.2f}", inline=True)
-        embed.add_field(name="Seen", value=str(stats["seen"]), inline=True)
-        embed.add_field(name="Checked", value=str(stats["checked"]), inline=True)
-        embed.add_field(name="Skipped", value=str(stats["skipped"]), inline=True)
-        embed.add_field(name="AI Calls", value=str(stats["ai_calls"]), inline=True)
-        embed.add_field(name="AI Failures", value=str(stats["ai_failures"]), inline=True)
-        embed.add_field(name="Violations", value=str(stats["violations"]), inline=True)
-        embed.add_field(name="Deleted", value=str(stats["deleted"]), inline=True)
-        embed.add_field(name="Timeouts", value=str(stats["timeouts"]), inline=True)
-        embed.add_field(name="Last Scan", value=str(stats["last_scan"]), inline=False)
+        embed.add_field(name="AI", value=self.bot._ai_label(settings) if settings.ai_enabled else "꺼짐", inline=True)
+        embed.add_field(name="전체 AI 검사", value=_enabled_label(scan_all), inline=True)
+        embed.add_field(name="확신도 기준", value=f"{settings.confidence_threshold:.2f}", inline=True)
+        embed.add_field(name="수신", value=str(stats["seen"]), inline=True)
+        embed.add_field(name="검사", value=str(stats["checked"]), inline=True)
+        embed.add_field(name="건너뜀", value=str(stats["skipped"]), inline=True)
+        embed.add_field(name="AI 호출", value=str(stats["ai_calls"]), inline=True)
+        embed.add_field(name="AI 실패", value=str(stats["ai_failures"]), inline=True)
+        embed.add_field(name="위반", value=str(stats["violations"]), inline=True)
+        embed.add_field(name="삭제", value=str(stats["deleted"]), inline=True)
+        embed.add_field(name="타임아웃", value=str(stats["timeouts"]), inline=True)
+        embed.add_field(name="마지막 검사", value=str(stats["last_scan"]), inline=False)
 
         queue_len = len(self._groq_queues.get(guild.id, []))
         if queue_len:
-            embed.add_field(name="Groq Queue", value=str(queue_len), inline=True)
+            embed.add_field(name="Groq 대기열", value=str(queue_len), inline=True)
         cooldown = self.bot._groq_cooldown_remaining()
         if cooldown > 0:
-            embed.add_field(name="Groq Cooldown", value=f"{cooldown:.0f}s (using local fallback)", inline=True)
+            embed.add_field(name="Groq 대기", value=f"{cooldown:.0f}초 (로컬 폴백 사용 중)", inline=True)
 
         if stats.get("last_error"):
-            embed.add_field(name="Last Error", value=str(stats["last_error"])[:1000], inline=False)
+            embed.add_field(name="최근 오류", value=str(stats["last_error"])[:1000], inline=False)
 
         try:
             await channel.send(embed=embed)
@@ -752,7 +796,7 @@ class ModerationCog(commands.Cog):
         return min(MAX_TIMEOUT_MINUTES, base * multiplier)
 
     async def _timeout_member(self, member: discord.Member, minutes: int, reason: str) -> str:
-        reason_text = f"PrettyWords profanity filter: {reason[:120]}"
+        reason_text = f"PrettyWords 비속어 필터: {reason[:120]}"
         try:
             await member.timeout(timedelta(minutes=minutes), reason=reason_text)
             return f"timeout {minutes}m"
@@ -788,31 +832,31 @@ class ModerationCog(commands.Cog):
             return
 
         embed = discord.Embed(
-            title=f"PrettyWords Case #{infraction_id}",
+            title=f"PrettyWords 제재 기록 #{infraction_id}",
             color=discord.Color.orange(),
-            description=decision.reason[:350] or "Policy violation detected.",
+            description=decision.reason[:350] or "정책 위반 가능성이 감지되었습니다.",
         )
         embed.add_field(
-            name="User",
+            name="사용자",
             value=f"{message.author.mention} {message.author} (`{message.author.id}`)",
             inline=False,
         )
-        embed.add_field(name="Channel", value=message.channel.mention, inline=True)
-        embed.add_field(name="Action", value=action, inline=True)
-        embed.add_field(name="Timeout", value=f"{timeout_minutes}m", inline=True)
-        embed.add_field(name="Confidence", value=f"{decision.confidence:.2f}", inline=True)
-        embed.add_field(name="Severity", value=str(decision.severity), inline=True)
-        embed.add_field(name="Source", value=decision.source, inline=True)
-        embed.add_field(name="Message Link", value=f"[Jump]({message.jump_url})", inline=False)
+        embed.add_field(name="채널", value=message.channel.mention, inline=True)
+        embed.add_field(name="조치", value=_action_label(action), inline=True)
+        embed.add_field(name="타임아웃", value=f"{timeout_minutes}분", inline=True)
+        embed.add_field(name="확신도", value=f"{decision.confidence:.2f}", inline=True)
+        embed.add_field(name="심각도", value=str(decision.severity), inline=True)
+        embed.add_field(name="판정 출처", value=_source_label(decision.source), inline=True)
+        embed.add_field(name="메시지 링크", value=f"[바로가기]({message.jump_url})", inline=False)
         if decision.categories:
             embed.add_field(
-                name="Categories",
+                name="카테고리",
                 value=", ".join(category_label(category) for category in decision.categories)[:250],
                 inline=False,
             )
         if decision.matched_terms:
-            embed.add_field(name="Matched", value=", ".join(decision.matched_terms)[:250], inline=False)
-        embed.add_field(name="Message", value=message.content[:900] or "(empty)", inline=False)
+            embed.add_field(name="감지된 표현", value=", ".join(decision.matched_terms)[:250], inline=False)
+        embed.add_field(name="메시지", value=message.content[:900] or "(비어 있음)", inline=False)
         embed.set_footer(text="/filter report 또는 /filter resolve-report 로 검토")
 
         try:
@@ -842,7 +886,7 @@ class ModerationCog(commands.Cog):
     ) -> None:
         try:
             await user.send(
-                f"PrettyWords case #{infraction_id}: 서버 규칙 위반 가능성이 감지되었습니다. "
+                f"PrettyWords 제재 기록 #{infraction_id}: 서버 규칙 위반 가능성이 감지되었습니다. "
                 f"타임아웃: {timeout_minutes}분. 사유: {reason[:250]} "
                 f"오탐이면 서버에서 `/filter report case_id:{infraction_id}` 명령으로 이의제기하세요. "
                 "봇 관리자가 승인해야 학습에 반영됩니다."
@@ -858,36 +902,36 @@ class ModerationCog(commands.Cog):
         blocked = await self.bot.store.list_blocked_terms(interaction.guild_id)
         allowed = await self.bot.store.list_allowed_terms(interaction.guild_id)
         config_admins = await self.bot.store.list_config_admins(interaction.guild_id)
-        embed = discord.Embed(title="PrettyWords Status", color=discord.Color.green())
-        embed.add_field(name="Paused", value=str(settings.paused), inline=True)
+        embed = discord.Embed(title="PrettyWords 상태", color=discord.Color.green())
+        embed.add_field(name="일시정지", value=_enabled_label(settings.paused), inline=True)
         _provider, _model, scan_all = self.bot._effective_ai_settings(settings)
-        embed.add_field(name="AI", value=self.bot._ai_label(settings) if settings.ai_enabled else "disabled", inline=True)
-        embed.add_field(name="AI Scan All", value=str(scan_all), inline=True)
-        embed.add_field(name="Health Logs", value=str(settings.health_log_enabled), inline=True)
-        embed.add_field(name="Dry Run", value=str(settings.dry_run), inline=True)
-        embed.add_field(name="Timeout", value=f"{settings.timeout_minutes}m", inline=True)
-        embed.add_field(name="Threshold", value=f"{settings.confidence_threshold:.2f}", inline=True)
-        embed.add_field(name="Escalate", value=str(settings.escalate), inline=True)
-        embed.add_field(name="Log Channel", value=f"<#{settings.log_channel_id}>" if settings.log_channel_id else "not set", inline=False)
+        embed.add_field(name="AI", value=self.bot._ai_label(settings) if settings.ai_enabled else "꺼짐", inline=True)
+        embed.add_field(name="전체 AI 검사", value=_enabled_label(scan_all), inline=True)
+        embed.add_field(name="상태 로그", value=_enabled_label(settings.health_log_enabled), inline=True)
+        embed.add_field(name="모의 실행", value=_enabled_label(settings.dry_run), inline=True)
+        embed.add_field(name="타임아웃", value=f"{settings.timeout_minutes}분", inline=True)
+        embed.add_field(name="확신도 기준", value=f"{settings.confidence_threshold:.2f}", inline=True)
+        embed.add_field(name="반복 위반 가중", value=_enabled_label(settings.escalate), inline=True)
+        embed.add_field(name="제재/신고 로그 채널", value=f"<#{settings.log_channel_id}>" if settings.log_channel_id else "미설정", inline=False)
         health_channel_value = (
             f"<#{settings.health_log_channel_id}>"
             if settings.health_log_channel_id
-            else (f"log channel (<#{settings.log_channel_id}>)" if settings.log_channel_id else "not set")
+            else (f"제재/신고 로그 채널 사용 (<#{settings.log_channel_id}>)" if settings.log_channel_id else "미설정")
         )
         embed.add_field(
-            name="Health Channel",
+            name="상태 로그 채널",
             value=health_channel_value,
             inline=False,
         )
-        embed.add_field(name="Disabled Channels", value=", ".join(f"<#{cid}>" for cid in disabled) or "none", inline=False)
-        embed.add_field(name="Custom Blocked Terms", value=str(len(blocked)), inline=True)
-        embed.add_field(name="Allowed Terms", value=str(len(allowed)), inline=True)
-        embed.add_field(name="Config Admins", value=str(len(config_admins)), inline=True)
+        embed.add_field(name="필터 비활성 채널", value=", ".join(f"<#{cid}>" for cid in disabled) or "없음", inline=False)
+        embed.add_field(name="서버 금지어", value=str(len(blocked)), inline=True)
+        embed.add_field(name="허용어", value=str(len(allowed)), inline=True)
+        embed.add_field(name="설정 관리자", value=str(len(config_admins)), inline=True)
         await send_interaction(interaction, embed=embed)
 
-    @admin.command(name="config-admin-add", description="Allow a Discord user ID to configure PrettyWords")
+    @admin.command(name="config-admin-add", description="PrettyWords 설정 가능 관리자 ID를 추가합니다")
     @mod_only()
-    @app_commands.describe(user_id="Discord user ID or mention")
+    @app_commands.describe(user_id="Discord 사용자 ID 또는 멘션")
     async def config_admin_add(self, interaction: discord.Interaction, user_id: str) -> None:
         try:
             parsed_user_id = _parse_discord_id(user_id)
@@ -899,13 +943,13 @@ class ModerationCog(commands.Cog):
         await send_interaction(interaction, f"설정 관리자 추가됨: `{parsed_user_id}`")
         await self._log_admin_event(
             interaction.guild,
-            "Config Admin Added",
-            f"{interaction.user} added `{parsed_user_id}`",
+            "설정 관리자 추가",
+            f"{interaction.user}님이 `{parsed_user_id}`를 설정 관리자로 추가했습니다.",
         )
 
-    @admin.command(name="config-admin-remove", description="Remove a PrettyWords config admin Discord ID")
+    @admin.command(name="config-admin-remove", description="PrettyWords 설정 관리자 ID를 제거합니다")
     @mod_only()
-    @app_commands.describe(user_id="Discord user ID or mention")
+    @app_commands.describe(user_id="Discord 사용자 ID 또는 멘션")
     async def config_admin_remove(self, interaction: discord.Interaction, user_id: str) -> None:
         try:
             parsed_user_id = _parse_discord_id(user_id)
@@ -918,18 +962,18 @@ class ModerationCog(commands.Cog):
         if count:
             await self._log_admin_event(
                 interaction.guild,
-                "Config Admin Removed",
-                f"{interaction.user} removed `{parsed_user_id}`",
+                "설정 관리자 제거",
+                f"{interaction.user}님이 `{parsed_user_id}`를 설정 관리자에서 제거했습니다.",
             )
 
-    @admin.command(name="config-admin-list", description="List PrettyWords config admin Discord IDs")
+    @admin.command(name="config-admin-list", description="PrettyWords 설정 관리자 ID 목록을 봅니다")
     @mod_only()
     async def config_admin_list(self, interaction: discord.Interaction) -> None:
         admins = await self.bot.store.list_config_admins(interaction.guild_id)
         global_admins = sorted(self.bot.config.bot_admin_ids)
         lines = []
         if admins:
-            lines.append("Server: " + ", ".join(f"`{admin_id}`" for admin_id in admins))
+            lines.append("서버 설정: " + ", ".join(f"`{admin_id}`" for admin_id in admins))
         if global_admins:
             lines.append(".env: " + ", ".join(f"`{admin_id}`" for admin_id in global_admins))
         await send_interaction(interaction, "\n".join(lines) if lines else "설정 관리자 ID 없음")
@@ -939,16 +983,16 @@ class ModerationCog(commands.Cog):
     async def log_channel(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
         settings = await self.bot.store.update_settings(interaction.guild_id, log_channel_id=channel.id)
         await send_interaction(interaction, f"로그 채널 설정됨: {channel.mention}")
-        await self._log_admin_event(interaction.guild, "Log Channel Updated", f"{interaction.user} set logs to {channel.mention}")
+        await self._log_admin_event(interaction.guild, "로그 채널 변경", f"{interaction.user}님이 로그 채널을 {channel.mention}로 설정했습니다.")
 
     @filter.command(name="health-log-channel", description="상태 로그 전용 채널을 설정합니다")
     @mod_only()
     async def health_log_channel(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
         settings = await self.bot.store.update_settings(interaction.guild_id, health_log_channel_id=channel.id)
         await send_interaction(interaction, f"상태 로그 채널 설정됨: {channel.mention}")
-        await self._send_health_log(interaction.guild, settings, title="PrettyWords Health Channel Connected")
+        await self._send_health_log(interaction.guild, settings, title="PrettyWords 상태 로그 채널 연결됨")
 
-    @filter.command(name="health", description="Send current PrettyWords health to the log channel")
+    @filter.command(name="health", description="현재 PrettyWords 상태를 로그 채널로 보냅니다")
     @mod_only()
     async def health(self, interaction: discord.Interaction) -> None:
         settings = await self.bot.store.get_settings(interaction.guild_id)
@@ -958,13 +1002,13 @@ class ModerationCog(commands.Cog):
         await self._send_health_log(interaction.guild, settings)
         await send_interaction(interaction, "상태 로그 전송됨")
 
-    @filter.command(name="health-log", description="Enable or disable periodic health logs")
+    @filter.command(name="health-log", description="주기적인 상태 로그를 켜거나 끕니다")
     @mod_only()
     async def health_log(self, interaction: discord.Interaction, enabled: bool) -> None:
         settings = await self.bot.store.update_settings(interaction.guild_id, health_log_enabled=enabled)
-        await send_interaction(interaction, f"상태 로그: {enabled}")
+        await send_interaction(interaction, f"상태 로그: {_enabled_label(enabled)}")
         if enabled and (settings.health_log_channel_id or settings.log_channel_id):
-            await self._send_health_log(interaction.guild, settings, title="PrettyWords Health Logs Enabled")
+            await self._send_health_log(interaction.guild, settings, title="PrettyWords 상태 로그 켜짐")
 
     @filter.command(name="timeout", description="비속어 사용 시 타임아웃 시간을 설정합니다")
     @mod_only()
@@ -972,7 +1016,7 @@ class ModerationCog(commands.Cog):
     async def timeout(self, interaction: discord.Interaction, minutes: app_commands.Range[int, 0, MAX_TIMEOUT_MINUTES]) -> None:
         await self.bot.store.update_settings(interaction.guild_id, timeout_minutes=int(minutes))
         await send_interaction(interaction, f"타임아웃 기본값: {minutes}분")
-        await self._log_admin_event(interaction.guild, "Timeout Updated", f"{interaction.user} set timeout to {minutes}m")
+        await self._log_admin_event(interaction.guild, "타임아웃 변경", f"{interaction.user}님이 기본 타임아웃을 {minutes}분으로 설정했습니다.")
 
     @filter.command(name="threshold", description="AI/필터 확신도 기준을 설정합니다")
     @mod_only()
@@ -980,7 +1024,7 @@ class ModerationCog(commands.Cog):
         await self.bot.store.update_settings(interaction.guild_id, confidence_threshold=float(confidence))
         await send_interaction(interaction, f"확신도 기준: {confidence:.2f}")
 
-    @filter.command(name="mode", description="삭제/DM/dry-run/AI/escalation 설정을 바꿉니다")
+    @filter.command(name="mode", description="삭제/DM/모의 실행/AI/반복 위반 가중 설정을 바꿉니다")
     @mod_only()
     async def mode(
         self,
@@ -1006,26 +1050,27 @@ class ModerationCog(commands.Cog):
         await send_interaction(
             interaction,
             (
-                f"모드 업데이트: delete={settings.delete_messages}, dm={settings.dm_users}, "
-                f"dry_run={settings.dry_run}, ai={settings.ai_enabled}, escalate={settings.escalate}"
+                f"모드 업데이트: 삭제={_enabled_label(settings.delete_messages)}, DM={_enabled_label(settings.dm_users)}, "
+                f"모의 실행={_enabled_label(settings.dry_run)}, AI={_enabled_label(settings.ai_enabled)}, "
+                f"반복 위반 가중={_enabled_label(settings.escalate)}"
             ),
         )
 
-    @filter.command(name="ai", description="AI provider/model settings")
+    @filter.command(name="ai", description="AI 제공자/모델 설정을 바꿉니다")
     @mod_only()
     @app_commands.choices(
         provider=[
-            app_commands.Choice(name="default (.env)", value="default"),
+            app_commands.Choice(name="기본값(.env)", value="default"),
             app_commands.Choice(name="ollama", value="ollama"),
             app_commands.Choice(name="openai", value="openai"),
             app_commands.Choice(name="groq", value="groq"),
-            app_commands.Choice(name="none", value="none"),
-            app_commands.Choice(name="auto", value="auto"),
+            app_commands.Choice(name="사용 안 함", value="none"),
+            app_commands.Choice(name="자동", value="auto"),
         ]
     )
     @app_commands.describe(
-        model="Example: qwen3:4b, qwen3:1.7b, or default",
-        scan_all="false = only suspicious messages go to AI",
+        model="예: qwen3:4b, qwen3:1.7b, default",
+        scan_all="false면 의심 메시지만 AI로 보냅니다",
     )
     async def ai(
         self,
@@ -1047,10 +1092,10 @@ class ModerationCog(commands.Cog):
         _provider, _model, effective_scan_all = self.bot._effective_ai_settings(settings)
         await send_interaction(
             interaction,
-            f"AI: {self.bot._ai_label(settings)}, scan_all={effective_scan_all}",
+            f"AI: {self.bot._ai_label(settings)}, 전체 AI 검사={_enabled_label(effective_scan_all)}",
         )
 
-    @filter.command(name="ai-reset", description="AI settings back to .env defaults")
+    @filter.command(name="ai-reset", description="AI 설정을 .env 기본값으로 되돌립니다")
     @mod_only()
     async def ai_reset(self, interaction: discord.Interaction) -> None:
         settings = await self.bot.store.update_settings(
@@ -1062,7 +1107,7 @@ class ModerationCog(commands.Cog):
         _provider, _model, effective_scan_all = self.bot._effective_ai_settings(settings)
         await send_interaction(
             interaction,
-            f"AI reset: {self.bot._ai_label(settings)}, scan_all={effective_scan_all}",
+            f"AI 설정 초기화됨: {self.bot._ai_label(settings)}, 전체 AI 검사={_enabled_label(effective_scan_all)}",
         )
 
     @filter.command(name="pause", description="필터를 일시정지합니다")
@@ -1070,14 +1115,14 @@ class ModerationCog(commands.Cog):
     async def pause(self, interaction: discord.Interaction, reason: Optional[str] = None) -> None:
         await self.bot.store.update_settings(interaction.guild_id, paused=True)
         await send_interaction(interaction, "필터 일시정지됨")
-        await self._log_admin_event(interaction.guild, "Filter Paused", f"{interaction.user}: {reason or 'no reason'}")
+        await self._log_admin_event(interaction.guild, "필터 일시정지", f"{interaction.user}: {reason or '사유 없음'}")
 
     @filter.command(name="resume", description="필터를 다시 시작합니다")
     @mod_only()
     async def resume(self, interaction: discord.Interaction) -> None:
         await self.bot.store.update_settings(interaction.guild_id, paused=False)
         await send_interaction(interaction, "필터 다시 시작됨")
-        await self._log_admin_event(interaction.guild, "Filter Resumed", f"{interaction.user} resumed filtering")
+        await self._log_admin_event(interaction.guild, "필터 다시 시작", f"{interaction.user}님이 필터를 다시 시작했습니다.")
 
     @filter.command(name="disable-channel", description="특정 채널에서 필터를 끕니다")
     @mod_only()
@@ -1122,7 +1167,7 @@ class ModerationCog(commands.Cog):
         )
         await send_interaction(
             interaction,
-            f"등록됨: `{term}` category={category_label(normalized_category)} severity={severity}",
+            f"등록됨: `{term}` 카테고리={category_label(normalized_category)} 심각도={severity}",
         )
 
     @filter.command(name="remove-word", description="서버 전용 금지어를 제거합니다")
@@ -1181,7 +1226,7 @@ class ModerationCog(commands.Cog):
             term,
             int(severity),
             interaction.user.id,
-            f"learned from message {target_message.id}",
+            f"메시지 {target_message.id}에서 학습",
             category=normalized_category,
         )
         await self.bot.store.add_learning_event(
@@ -1195,20 +1240,20 @@ class ModerationCog(commands.Cog):
             created_by=interaction.user.id,
         )
 
-        note = "" if term_found else "\n주의: term이 메시지에 정확히 포함되지는 않음. 우회표현이면 정상일 수 있음."
+        note = "" if term_found else "\n주의: 등록 표현이 메시지에 정확히 포함되지는 않음. 우회표현이면 정상일 수 있음."
         await interaction.followup.send(
             (
-                f"학습됨: `{term}` → {category_label(normalized_category)} severity={severity}\n"
+                f"학습됨: `{term}` → {category_label(normalized_category)} 심각도={severity}\n"
                 f"메시지: {target_message.jump_url}{note}"
             ),
             ephemeral=True,
         )
         await self._log_admin_event(
             interaction.guild,
-            "Message Learned",
+            "메시지 학습",
             (
-                f"{interaction.user} learned `{term}` as {normalized_category} "
-                f"from [message]({target_message.jump_url})"
+                f"{interaction.user}님이 [메시지]({target_message.jump_url})의 `{term}`을 "
+                f"{category_label(normalized_category)} 카테고리로 학습시켰습니다."
             ),
         )
 
@@ -1225,7 +1270,7 @@ class ModerationCog(commands.Cog):
         await send_interaction(interaction, "제거됨" if count else "등록된 항목 없음")
 
     @filter.command(name="report", description="부적절한 제재/오탐을 신고합니다")
-    @app_commands.describe(case_id="로그나 DM에 표시된 PrettyWords case ID")
+    @app_commands.describe(case_id="로그나 DM에 표시된 PrettyWords 제재 기록 ID")
     async def report(
         self,
         interaction: discord.Interaction,
@@ -1244,7 +1289,7 @@ class ModerationCog(commands.Cog):
             infraction_id=case_id,
             message_id=parsed_message_id,
         )
-        await send_interaction(interaction, f"이의제기/신고 접수됨: report #{report_id}. 관리자 승인 후 학습됩니다.")
+        await send_interaction(interaction, f"이의제기/신고 접수됨: 신고 #{report_id}. 관리자 승인 후 학습됩니다.")
         await self._log_report(interaction, report_id, case_id, reason)
 
     async def _log_report(
@@ -1261,12 +1306,12 @@ class ModerationCog(commands.Cog):
         if not isinstance(channel, discord.abc.Messageable):
             return
         embed = discord.Embed(
-            title=f"PrettyWords Report #{report_id}",
+            title=f"PrettyWords 신고 #{report_id}",
             description=reason[:900],
             color=discord.Color.red(),
         )
-        embed.add_field(name="Reporter", value=f"{interaction.user.mention} {interaction.user} (`{interaction.user.id}`)", inline=False)
-        embed.add_field(name="Case", value=f"#{case_id}" if case_id else "not provided", inline=True)
+        embed.add_field(name="신고자", value=f"{interaction.user.mention} {interaction.user} (`{interaction.user.id}`)", inline=False)
+        embed.add_field(name="제재 기록", value=f"#{case_id}" if case_id else "없음", inline=True)
         embed.set_footer(text="/filter resolve-report outcome:false_positive 승인 시 비속어 아님으로 학습")
         await channel.send(embed=embed)
 
@@ -1303,7 +1348,7 @@ class ModerationCog(commands.Cog):
                 interaction.guild_id,
                 infraction.normalized_hash,
                 interaction.user.id,
-                reason=f"report #{report_id}",
+                reason=f"신고 #{report_id}",
             )
             await self.bot.store.add_learning_event(
                 guild_id=interaction.guild_id,
@@ -1332,11 +1377,11 @@ class ModerationCog(commands.Cog):
                     term,
                     2,
                     interaction.user.id,
-                    "from report",
+                    "신고 처리에서 추가됨",
                     category=normalized_category,
                 )
 
-        await send_interaction(interaction, f"report #{report_id} 처리됨: {outcome}")
+        await send_interaction(interaction, f"신고 #{report_id} 처리됨: {_outcome_label(outcome)}")
 
     @filter.command(name="exempt-role-add", description="필터 예외 역할을 추가합니다")
     @mod_only()
