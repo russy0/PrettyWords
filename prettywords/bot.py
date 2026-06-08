@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -8,9 +10,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from .ai import AIContext, OllamaClassifier, OpenAIClassifier
+from .ai import AIContext, GroqClassifier, OllamaClassifier, OpenAIClassifier, RateLimitedError
 from .config import BotConfig, load_config
-from .filtering import LocalClassifier, combine_decisions, message_fingerprint
+from .filtering import LocalClassifier, ModerationDecision, combine_decisions, message_fingerprint
 from .storage import GuildSettings, ModerationStore
 
 
@@ -65,6 +67,16 @@ def mod_only() -> app_commands.Check:
     return app_commands.check(predicate)
 
 
+@dataclass(slots=True)
+class _PendingClassification:
+    """A message waiting to be classified as part of a Groq batch."""
+
+    message: discord.Message
+    settings: GuildSettings
+    local: ModerationDecision
+    queued_at: datetime
+
+
 async def send_interaction(
     interaction: discord.Interaction,
     content: str | None = None,
@@ -93,6 +105,7 @@ class PrettyWordsBot(commands.Bot):
         self.store = ModerationStore(config.database_path)
         self.local_classifier = LocalClassifier()
         self._ai_classifier_cache = {}
+        self._groq_unavailable_until: datetime | None = None
 
     def _effective_ai_settings(self, settings: GuildSettings) -> tuple[str, str, bool]:
         provider = (settings.ai_provider or self.config.ai_provider).strip().lower()
@@ -101,6 +114,8 @@ class PrettyWordsBot(commands.Bot):
                 provider = "ollama"
             elif self.config.openai_api_key:
                 provider = "openai"
+            elif self.config.groq_api_keys:
+                provider = "groq"
             else:
                 provider = "none"
 
@@ -108,6 +123,8 @@ class PrettyWordsBot(commands.Bot):
             model = settings.ai_model or self.config.ollama_model
         elif provider == "openai":
             model = settings.ai_model or self.config.openai_model
+        elif provider == "groq":
+            model = settings.ai_model or self.config.groq_model
         else:
             model = settings.ai_model or ""
 
@@ -122,14 +139,7 @@ class PrettyWordsBot(commands.Bot):
             if not model:
                 LOGGER.warning("AI_PROVIDER=ollama but OLLAMA_MODEL is empty; AI disabled")
                 return None
-            key = ("ollama", self.config.ollama_base_url, model, self.config.ollama_timeout_seconds)
-            if key not in self._ai_classifier_cache:
-                self._ai_classifier_cache[key] = OllamaClassifier(
-                    self.config.ollama_base_url,
-                    model,
-                    timeout_seconds=self.config.ollama_timeout_seconds,
-                )
-            return self._ai_classifier_cache[key]
+            return self._cached_ollama_classifier(self.config.ollama_base_url, model, self.config.ollama_timeout_seconds)
         if provider == "openai":
             if not self.config.openai_api_key:
                 LOGGER.warning("AI_PROVIDER=openai but OPENAI_API_KEY is empty; AI disabled")
@@ -138,8 +148,47 @@ class PrettyWordsBot(commands.Bot):
             if key not in self._ai_classifier_cache:
                 self._ai_classifier_cache[key] = OpenAIClassifier(self.config.openai_api_key, model)
             return self._ai_classifier_cache[key]
+        if provider == "groq":
+            if not self.config.groq_api_keys:
+                LOGGER.warning("AI_PROVIDER=groq but GROQ_API_KEY is empty; AI disabled")
+                return None
+            if not model:
+                LOGGER.warning("AI_PROVIDER=groq but no Groq model configured; AI disabled")
+                return None
+            key = ("groq", model, self.config.groq_api_keys)
+            if key not in self._ai_classifier_cache:
+                self._ai_classifier_cache[key] = GroqClassifier(self.config.groq_api_keys, model)
+            return self._ai_classifier_cache[key]
         LOGGER.warning("Unknown AI_PROVIDER=%s; AI disabled", provider)
         return None
+
+    def _cached_ollama_classifier(self, base_url: str, model: str, timeout_seconds: float) -> OllamaClassifier:
+        key = ("ollama", base_url, model, timeout_seconds)
+        if key not in self._ai_classifier_cache:
+            self._ai_classifier_cache[key] = OllamaClassifier(base_url, model, timeout_seconds=timeout_seconds)
+        return self._ai_classifier_cache[key]
+
+    def _groq_fallback_classifier(self) -> OllamaClassifier | None:
+        """Local Ollama classifier used while Groq is in a rate-limit cooldown."""
+        if not self.config.ollama_model:
+            return None
+        return self._cached_ollama_classifier(
+            self.config.ollama_base_url, self.config.ollama_model, self.config.ollama_timeout_seconds
+        )
+
+    def _groq_in_cooldown(self) -> bool:
+        return self._groq_unavailable_until is not None and datetime.now(timezone.utc) < self._groq_unavailable_until
+
+    def _groq_cooldown_remaining(self) -> float:
+        if self._groq_unavailable_until is None:
+            return 0.0
+        remaining = (self._groq_unavailable_until - datetime.now(timezone.utc)).total_seconds()
+        return max(0.0, remaining)
+
+    def _enter_groq_cooldown(self, retry_after: float | None = None) -> None:
+        seconds = retry_after if retry_after and retry_after > 0 else self.config.groq_rate_limit_cooldown_seconds
+        self._groq_unavailable_until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+        LOGGER.warning("Groq rate limited; using local fallback for about %.0fs", seconds)
 
     def _ai_label(self, settings: GuildSettings) -> str:
         provider, model, _scan_all = self._effective_ai_settings(settings)
@@ -172,12 +221,18 @@ class ModerationCog(commands.Cog):
     def __init__(self, bot: PrettyWordsBot) -> None:
         self.bot = bot
         self._stats: dict[int, dict[str, int | str]] = {}
+        self._groq_queues: dict[int, list[_PendingClassification]] = {}
+        self._groq_flush_locks: dict[int, asyncio.Lock] = {}
 
     async def cog_load(self) -> None:
         self.health_heartbeat.start()
+        self.groq_batch_flush.start()
 
     async def cog_unload(self) -> None:
         self.health_heartbeat.cancel()
+        self.groq_batch_flush.cancel()
+        for guild_id in list(self._groq_queues):
+            await self._flush_groq_queue(guild_id, force=True)
 
     def _guild_stats(self, guild_id: int) -> dict[str, int | str]:
         return self._stats.setdefault(
@@ -220,6 +275,23 @@ class ModerationCog(commands.Cog):
     async def before_health_heartbeat(self) -> None:
         await self.bot.wait_until_ready()
 
+    @tasks.loop(seconds=2)
+    async def groq_batch_flush(self) -> None:
+        """Flush per-guild Groq batches once they hit the size or time threshold (whichever first)."""
+        if not self._groq_queues:
+            return
+        now = datetime.now(timezone.utc)
+        window = timedelta(seconds=self.bot.config.groq_batch_window_seconds)
+        for guild_id, queue in list(self._groq_queues.items()):
+            if not queue:
+                continue
+            if len(queue) >= self.bot.config.groq_batch_size or (now - queue[0].queued_at) >= window:
+                await self._flush_groq_queue(guild_id)
+
+    @groq_batch_flush.before_loop
+    async def before_groq_batch_flush(self) -> None:
+        await self.bot.wait_until_ready()
+
     async def _send_health_log(
         self,
         guild: discord.Guild,
@@ -250,6 +322,14 @@ class ModerationCog(commands.Cog):
         embed.add_field(name="Deleted", value=str(stats["deleted"]), inline=True)
         embed.add_field(name="Timeouts", value=str(stats["timeouts"]), inline=True)
         embed.add_field(name="Last Scan", value=str(stats["last_scan"]), inline=False)
+
+        queue_len = len(self._groq_queues.get(guild.id, []))
+        if queue_len:
+            embed.add_field(name="Groq Queue", value=str(queue_len), inline=True)
+        cooldown = self.bot._groq_cooldown_remaining()
+        if cooldown > 0:
+            embed.add_field(name="Groq Cooldown", value=f"{cooldown:.0f}s (using local fallback)", inline=True)
+
         if stats.get("last_error"):
             embed.add_field(name="Last Error", value=str(stats["last_error"])[:1000], inline=False)
 
@@ -258,31 +338,28 @@ class ModerationCog(commands.Cog):
         except discord.HTTPException:
             LOGGER.exception("Failed to send health log")
 
-    async def _classify(self, guild_id: int, content: str, settings: GuildSettings):
-        blocked_terms = await self.bot.store.list_blocked_terms(guild_id)
-        allowed_terms = await self.bot.store.list_allowed_terms(guild_id)
-        local = self.bot.local_classifier.classify(content, blocked_terms, allowed_terms)
+    async def _build_ai_context(self, guild_id: int, blocked_terms, allowed_terms) -> AIContext:
+        return AIContext(
+            blocked_terms=blocked_terms,
+            allowed_terms=allowed_terms,
+            confirmed_examples=await self.bot.store.learning_examples(guild_id, "confirmed_bad"),
+            false_positive_examples=await self.bot.store.learning_examples(guild_id, "false_positive"),
+            auto_examples=await self.bot.store.learning_examples(guild_id, "auto_flagged"),
+        )
 
-        ai_decision = None
-        ai_called = False
-        ai_error = ""
-        provider, _model, scan_all = self.bot._effective_ai_settings(settings)
+    def _resolve_ai_classifier(self, settings: GuildSettings):
+        """Pick the classifier to use for this guild right now.
+
+        Returns (classifier, batchable). When the configured provider is Groq
+        and Groq is currently in a rate-limit cooldown, this transparently
+        substitutes the local Ollama classifier (if configured) so moderation
+        keeps working without hammering Groq.
+        """
+        provider, _model, _scan_all = self.bot._effective_ai_settings(settings)
+        if provider == "groq" and self.bot._groq_in_cooldown():
+            return self.bot._groq_fallback_classifier(), False
         classifier = self.bot._get_ai_classifier(settings)
-        should_call_ai = scan_all or local.violation
-        if settings.ai_enabled and classifier and should_call_ai:
-            ai_called = True
-            context = AIContext(
-                blocked_terms=blocked_terms,
-                allowed_terms=allowed_terms,
-                confirmed_examples=await self.bot.store.learning_examples(guild_id, "confirmed_bad"),
-                false_positive_examples=await self.bot.store.learning_examples(guild_id, "false_positive"),
-                auto_examples=await self.bot.store.learning_examples(guild_id, "auto_flagged"),
-            )
-            ai_decision = await classifier.classify(content, context)
-            if ai_decision is None:
-                ai_error = getattr(classifier, "last_error", "") or f"{provider} returned no decision"
-
-        return combine_decisions(local, ai_decision, settings.confidence_threshold), ai_called, ai_error
+        return classifier, isinstance(classifier, GroqClassifier)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -310,16 +387,274 @@ class ModerationCog(commands.Cog):
 
         self._bump(message.guild.id, "checked")
         self._mark_scan(message.guild.id)
-        decision, ai_called, ai_error = await self._classify(message.guild.id, message.content, settings)
+
+        LOGGER.debug(
+            "[%s] checking: %s#%s | %.80r",
+            message.guild.name,
+            message.author,
+            getattr(message.channel, "name", message.channel.id),
+            message.content,
+        )
+
+        blocked_terms = await self.bot.store.list_blocked_terms(message.guild.id)
+        allowed_terms = await self.bot.store.list_allowed_terms(message.guild.id)
+        local = self.bot.local_classifier.classify(message.content, blocked_terms, allowed_terms)
+
+        LOGGER.debug(
+            "[%s] local: violation=%s conf=%.2f matched=%s",
+            message.guild.name,
+            local.violation,
+            local.confidence,
+            list(local.matched_terms) or "[]",
+        )
+
+        _provider, _model, scan_all = self.bot._effective_ai_settings(settings)
+        classifier, batchable = self._resolve_ai_classifier(settings)
+        should_call_ai = bool(settings.ai_enabled and classifier is not None and (scan_all or local.violation))
+
+        LOGGER.debug(
+            "[%s] AI: provider=%s batchable=%s should_call=%s ai_enabled=%s",
+            message.guild.name,
+            getattr(classifier, "provider_name", "none") if classifier else "none",
+            batchable,
+            should_call_ai,
+            settings.ai_enabled,
+        )
+
+        if should_call_ai and batchable:
+            # Groq is active: queue this message and let it ride out in a batch
+            # instead of spending a request per message. _finish_moderation runs
+            # later, once the batch comes back.
+            await self._queue_for_batch(message, settings, local)
+            return
+
+        ai_decision = None
+        ai_called = False
+        ai_error = ""
+        if should_call_ai:
+            ai_called = True
+            provider_name = getattr(classifier, "provider_name", "?")
+            LOGGER.info(
+                "[%s] AI call (%s): %s#%s | %.80r",
+                message.guild.name,
+                provider_name,
+                message.author,
+                getattr(message.channel, "name", message.channel.id),
+                message.content,
+            )
+            context = await self._build_ai_context(message.guild.id, blocked_terms, allowed_terms)
+            ai_decision = await classifier.classify(message.content, context)
+            if ai_decision is None:
+                ai_error = getattr(classifier, "last_error", "") or "AI returned no decision"
+                LOGGER.warning("[%s] AI failure (%s): %s", message.guild.name, provider_name, ai_error)
+            else:
+                LOGGER.info(
+                    "[%s] AI result (%s): violation=%s conf=%.2f severity=%d reason=%.120s",
+                    message.guild.name,
+                    provider_name,
+                    ai_decision.violation,
+                    ai_decision.confidence,
+                    ai_decision.severity,
+                    ai_decision.reason,
+                )
+
         if ai_called:
             self._bump(message.guild.id, "ai_calls")
         if ai_error:
             self._bump(message.guild.id, "ai_failures")
             self._set_last_error(message.guild.id, ai_error)
 
-        if not decision.violation or decision.confidence < settings.confidence_threshold:
+        decision = combine_decisions(local, ai_decision, settings.confidence_threshold)
+        LOGGER.debug(
+            "[%s] combined: source=%s violation=%s conf=%.2f threshold=%.2f",
+            message.guild.name,
+            decision.source,
+            decision.violation,
+            decision.confidence,
+            settings.confidence_threshold,
+        )
+        await self._finish_moderation(message, decision, settings)
+
+    async def _queue_for_batch(
+        self, message: discord.Message, settings: GuildSettings, local: ModerationDecision
+    ) -> None:
+        queue = self._groq_queues.setdefault(message.guild.id, [])
+        queue.append(
+            _PendingClassification(
+                message=message,
+                settings=settings,
+                local=local,
+                queued_at=datetime.now(timezone.utc),
+            )
+        )
+        LOGGER.debug(
+            "[%s] queued for Groq batch: depth=%d/%d | %s | %.60r",
+            message.guild.name,
+            len(queue),
+            self.bot.config.groq_batch_size,
+            message.author,
+            message.content,
+        )
+        if len(queue) >= self.bot.config.groq_batch_size:
+            await self._flush_groq_queue(message.guild.id)
+
+    async def _flush_groq_queue(self, guild_id: int, *, force: bool = False) -> None:
+        """Pop up to one batch's worth of queued messages and classify them together.
+
+        `force` is used on shutdown to drain whatever is left, even if it's a
+        partial batch that hasn't hit the size/time threshold yet.
+        """
+        lock = self._groq_flush_locks.setdefault(guild_id, asyncio.Lock())
+        async with lock:
+            queue = self._groq_queues.get(guild_id)
+            if not queue:
+                return
+            now = datetime.now(timezone.utc)
+            window = timedelta(seconds=self.bot.config.groq_batch_window_seconds)
+            ready = force or len(queue) >= self.bot.config.groq_batch_size or (now - queue[0].queued_at) >= window
+            if not ready:
+                return
+
+            batch_size = max(1, self.bot.config.groq_batch_size)
+            items, remainder = queue[:batch_size], queue[batch_size:]
+            queue[:] = remainder
+            if not items:
+                return
+
+            blocked_terms = await self.bot.store.list_blocked_terms(guild_id)
+            allowed_terms = await self.bot.store.list_allowed_terms(guild_id)
+            context = await self._build_ai_context(guild_id, blocked_terms, allowed_terms)
+
+            # Re-resolve against the latest settings: the provider may have
+            # changed, or a Groq cooldown may have just kicked in/expired.
+            current_settings = await self.bot.store.get_settings(guild_id)
+            classifier, batchable = self._resolve_ai_classifier(current_settings)
+            provider_name = getattr(classifier, "provider_name", "none") if classifier else "none"
+
+            LOGGER.info(
+                "[guild:%d] flushing batch: %d messages | provider=%s batchable=%s force=%s",
+                guild_id,
+                len(items),
+                provider_name,
+                batchable,
+                force,
+            )
+
+            if classifier is not None and batchable:
+                try:
+                    decisions = await classifier.classify_batch(
+                        [item.message.content for item in items], context
+                    )
+                except RateLimitedError as exc:
+                    LOGGER.warning(
+                        "[guild:%d] all Groq keys rate limited; entering cooldown and falling back to Ollama",
+                        guild_id,
+                    )
+                    self.bot._enter_groq_cooldown(exc.retry_after)
+                    await self._finish_batch_with_fallback(items, context)
+                    return
+                violations = sum(1 for d in decisions if d and d.violation)
+                LOGGER.info(
+                    "[guild:%d] Groq batch done: %d decisions | %d violations",
+                    guild_id,
+                    len(decisions),
+                    violations,
+                )
+                for item, ai_decision in zip(items, decisions):
+                    await self._complete_classification(item, ai_decision, classifier)
+                return
+
+            # Active classifier isn't (or no longer is) Groq batching — e.g. we
+            # just entered a cooldown and fell back to Ollama. Process one by one.
+            LOGGER.debug("[guild:%d] batch falling back to one-by-one via %s", guild_id, provider_name)
+            for item in items:
+                ai_decision = await classifier.classify(item.message.content, context) if classifier else None
+                await self._complete_classification(item, ai_decision, classifier)
+
+    async def _finish_batch_with_fallback(
+        self, items: list[_PendingClassification], context: AIContext
+    ) -> None:
+        fallback = self.bot._groq_fallback_classifier()
+        LOGGER.info(
+            "Groq rate-limit fallback: processing %d messages via %s",
+            len(items),
+            getattr(fallback, "provider_name", "none") if fallback else "none (no fallback)",
+        )
+        for item in items:
+            ai_decision = None
+            if fallback is not None:
+                try:
+                    ai_decision = await fallback.classify(item.message.content, context)
+                except Exception:
+                    LOGGER.exception("Groq cooldown fallback classification failed")
+            await self._complete_classification(item, ai_decision, fallback)
+
+    async def _complete_classification(
+        self,
+        item: _PendingClassification,
+        ai_decision: ModerationDecision | None,
+        classifier,
+    ) -> None:
+        guild_id = item.message.guild.id if item.message.guild else None
+        if guild_id is None:
             return
 
+        ai_called = classifier is not None
+        provider_name = getattr(classifier, "provider_name", "?") if classifier else "none"
+        if ai_called:
+            self._bump(guild_id, "ai_calls")
+            if ai_decision is None:
+                ai_error = getattr(classifier, "last_error", "") or "AI returned no decision"
+                self._bump(guild_id, "ai_failures")
+                self._set_last_error(guild_id, ai_error)
+                LOGGER.warning(
+                    "[guild:%d] AI failure (%s): %s | %.60r",
+                    guild_id,
+                    provider_name,
+                    ai_error,
+                    item.message.content,
+                )
+            else:
+                LOGGER.info(
+                    "[guild:%d] AI result (%s): violation=%s conf=%.2f severity=%d reason=%.120s",
+                    guild_id,
+                    provider_name,
+                    ai_decision.violation,
+                    ai_decision.confidence,
+                    ai_decision.severity,
+                    ai_decision.reason,
+                )
+
+        decision = combine_decisions(item.local, ai_decision, item.settings.confidence_threshold)
+        LOGGER.debug(
+            "[guild:%d] combined: source=%s violation=%s conf=%.2f",
+            guild_id,
+            decision.source,
+            decision.violation,
+            decision.confidence,
+        )
+        await self._finish_moderation(item.message, decision, item.settings)
+
+    async def _finish_moderation(
+        self,
+        message: discord.Message,
+        decision: ModerationDecision,
+        settings: GuildSettings,
+    ) -> None:
+        if not decision.violation or decision.confidence < settings.confidence_threshold:
+            LOGGER.debug(
+                "[%s] pass: source=%s violation=%s conf=%.2f threshold=%.2f | %s | %.60r",
+                message.guild.name,
+                decision.source,
+                decision.violation,
+                decision.confidence,
+                settings.confidence_threshold,
+                message.author,
+                message.content,
+            )
+            return
+
+        fingerprint = message_fingerprint(message.content)
         self._bump(message.guild.id, "violations")
         recent = await self.bot.store.count_recent_infractions(message.guild.id, message.author.id)
         timeout_minutes = self._effective_timeout(settings, recent)
@@ -356,6 +691,16 @@ class ModerationCog(commands.Cog):
                     self._bump(message.guild.id, "timeout_failures")
 
         action = ", ".join(action_parts) or "logged"
+        LOGGER.info(
+            "[%s] VIOLATION: %s | source=%s conf=%.2f severity=%d | action=%s | %.80r",
+            message.guild.name,
+            message.author,
+            decision.source,
+            decision.confidence,
+            decision.severity,
+            action,
+            message.content,
+        )
         infraction_id = await self.bot.store.create_infraction(
             guild_id=message.guild.id,
             channel_id=message.channel.id,
@@ -369,7 +714,7 @@ class ModerationCog(commands.Cog):
             timeout_minutes=timeout_minutes,
         )
 
-        if decision.source in {"ai", "local+ai"} and decision.confidence >= 0.9:
+        if decision.source != "local" and decision.confidence >= 0.9:
             await self.bot.store.add_learning_event(
                 guild_id=message.guild.id,
                 label="auto_flagged",
@@ -633,6 +978,7 @@ class ModerationCog(commands.Cog):
             app_commands.Choice(name="default (.env)", value="default"),
             app_commands.Choice(name="ollama", value="ollama"),
             app_commands.Choice(name="openai", value="openai"),
+            app_commands.Choice(name="groq", value="groq"),
             app_commands.Choice(name="none", value="none"),
             app_commands.Choice(name="auto", value="auto"),
         ]
