@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -147,15 +148,18 @@ class OllamaClassifier:
         self.model = model
         self.timeout_seconds = timeout_seconds
         self.provider_name = "ollama"
+        self.last_error = ""
 
     async def classify(self, message: str, context: AIContext) -> ModerationDecision | None:
         try:
             return await asyncio.to_thread(self._classify_sync, message, context)
-        except Exception:
+        except Exception as exc:
+            self.last_error = f"{exc.__class__.__name__}: {exc}"
             LOGGER.exception("Ollama moderation request failed")
             return None
 
     def _classify_sync(self, message: str, context: AIContext) -> ModerationDecision | None:
+        self.last_error = ""
         body = {
             "model": self.model,
             "stream": False,
@@ -176,9 +180,18 @@ class OllamaClassifier:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 raw = response.read().decode("utf-8")
+        except (TimeoutError, socket.timeout) as exc:
+            self.last_error = f"Ollama timeout after {self.timeout_seconds:.0f}s"
+            LOGGER.warning("%s", self.last_error)
+            return None
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            LOGGER.error("Ollama HTTP %s: %s", exc.code, detail[:500])
+            self.last_error = f"Ollama HTTP {exc.code}: {detail[:180]}"
+            LOGGER.error("%s", self.last_error)
+            return None
+        except urllib.error.URLError as exc:
+            self.last_error = f"Ollama connection failed: {exc.reason}"
+            LOGGER.warning("%s", self.last_error)
             return None
 
         content = json.loads(raw).get("message", {}).get("content", "{}")

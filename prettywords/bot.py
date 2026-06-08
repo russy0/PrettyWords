@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from .ai import AIContext, OllamaClassifier, OpenAIClassifier
 from .config import BotConfig, load_config
@@ -167,9 +167,96 @@ class PrettyWordsBot(commands.Bot):
 
 class ModerationCog(commands.Cog):
     filter = app_commands.Group(name="filter", description="AI profanity filter settings")
+    admin = app_commands.Group(name="pw", description="PrettyWords bot administration")
 
     def __init__(self, bot: PrettyWordsBot) -> None:
         self.bot = bot
+        self._stats: dict[int, dict[str, int | str]] = {}
+
+    async def cog_load(self) -> None:
+        self.health_heartbeat.start()
+
+    async def cog_unload(self) -> None:
+        self.health_heartbeat.cancel()
+
+    def _guild_stats(self, guild_id: int) -> dict[str, int | str]:
+        return self._stats.setdefault(
+            guild_id,
+            {
+                "seen": 0,
+                "checked": 0,
+                "skipped": 0,
+                "ai_calls": 0,
+                "ai_failures": 0,
+                "violations": 0,
+                "deleted": 0,
+                "delete_failures": 0,
+                "timeouts": 0,
+                "timeout_failures": 0,
+                "last_scan": "never",
+                "last_error": "",
+            },
+        )
+
+    def _bump(self, guild_id: int, key: str, amount: int = 1) -> None:
+        stats = self._guild_stats(guild_id)
+        stats[key] = int(stats.get(key, 0)) + amount
+
+    def _mark_scan(self, guild_id: int) -> None:
+        self._guild_stats(guild_id)["last_scan"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    def _set_last_error(self, guild_id: int, error: str) -> None:
+        self._guild_stats(guild_id)["last_error"] = error[:240]
+
+    @tasks.loop(minutes=10)
+    async def health_heartbeat(self) -> None:
+        for guild in self.bot.guilds:
+            settings = await self.bot.store.get_settings(guild.id)
+            if not settings.health_log_enabled or not settings.log_channel_id:
+                continue
+            await self._send_health_log(guild, settings, title="PrettyWords Health")
+
+    @health_heartbeat.before_loop
+    async def before_health_heartbeat(self) -> None:
+        await self.bot.wait_until_ready()
+
+    async def _send_health_log(
+        self,
+        guild: discord.Guild,
+        settings: GuildSettings,
+        *,
+        title: str = "PrettyWords Health",
+    ) -> None:
+        channel = guild.get_channel(settings.log_channel_id) if settings.log_channel_id else None
+        if not isinstance(channel, discord.abc.Messageable):
+            return
+
+        stats = self._guild_stats(guild.id)
+        _provider, _model, scan_all = self.bot._effective_ai_settings(settings)
+        embed = discord.Embed(
+            title=title,
+            color=discord.Color.green() if not settings.paused else discord.Color.light_grey(),
+            description="Message scanning is running." if not settings.paused else "Filter is paused.",
+        )
+        embed.add_field(name="AI", value=self.bot._ai_label(settings) if settings.ai_enabled else "disabled", inline=True)
+        embed.add_field(name="AI Scan All", value=str(scan_all), inline=True)
+        embed.add_field(name="Threshold", value=f"{settings.confidence_threshold:.2f}", inline=True)
+        embed.add_field(name="Seen", value=str(stats["seen"]), inline=True)
+        embed.add_field(name="Checked", value=str(stats["checked"]), inline=True)
+        embed.add_field(name="Skipped", value=str(stats["skipped"]), inline=True)
+        embed.add_field(name="AI Calls", value=str(stats["ai_calls"]), inline=True)
+        embed.add_field(name="AI Failures", value=str(stats["ai_failures"]), inline=True)
+        embed.add_field(name="Violations", value=str(stats["violations"]), inline=True)
+        embed.add_field(name="Deleted", value=str(stats["deleted"]), inline=True)
+        embed.add_field(name="Timeouts", value=str(stats["timeouts"]), inline=True)
+        embed.add_field(name="Last Scan", value=str(stats["last_scan"]), inline=False)
+        if stats.get("last_error"):
+            embed.add_field(name="Last Error", value=str(stats["last_error"])[:1000], inline=False)
+
+        try:
+            await channel.send(embed=embed)
+        except discord.HTTPException:
+            LOGGER.exception("Failed to send health log")
 
     async def _classify(self, guild_id: int, content: str, settings: GuildSettings):
         blocked_terms = await self.bot.store.list_blocked_terms(guild_id)
@@ -177,10 +264,13 @@ class ModerationCog(commands.Cog):
         local = self.bot.local_classifier.classify(content, blocked_terms, allowed_terms)
 
         ai_decision = None
+        ai_called = False
+        ai_error = ""
         provider, _model, scan_all = self.bot._effective_ai_settings(settings)
         classifier = self.bot._get_ai_classifier(settings)
         should_call_ai = scan_all or local.violation
         if settings.ai_enabled and classifier and should_call_ai:
+            ai_called = True
             context = AIContext(
                 blocked_terms=blocked_terms,
                 allowed_terms=allowed_terms,
@@ -189,32 +279,48 @@ class ModerationCog(commands.Cog):
                 auto_examples=await self.bot.store.learning_examples(guild_id, "auto_flagged"),
             )
             ai_decision = await classifier.classify(content, context)
+            if ai_decision is None:
+                ai_error = getattr(classifier, "last_error", "") or f"{provider} returned no decision"
 
-        return combine_decisions(local, ai_decision, settings.confidence_threshold)
+        return combine_decisions(local, ai_decision, settings.confidence_threshold), ai_called, ai_error
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         if message.guild is None or message.author.bot or not message.content:
             return
 
+        self._bump(message.guild.id, "seen")
         settings = await self.bot.store.get_settings(message.guild.id)
         if settings.paused:
+            self._bump(message.guild.id, "skipped")
             return
         if await self.bot.store.is_channel_disabled(message.guild.id, message.channel.id):
+            self._bump(message.guild.id, "skipped")
             return
 
         role_ids = [role.id for role in getattr(message.author, "roles", [])]
         if await self.bot.store.is_user_exempt(message.guild.id, message.author.id, role_ids):
+            self._bump(message.guild.id, "skipped")
             return
 
         fingerprint = message_fingerprint(message.content)
         if await self.bot.store.is_allowed_hash(message.guild.id, fingerprint):
+            self._bump(message.guild.id, "skipped")
             return
 
-        decision = await self._classify(message.guild.id, message.content, settings)
+        self._bump(message.guild.id, "checked")
+        self._mark_scan(message.guild.id)
+        decision, ai_called, ai_error = await self._classify(message.guild.id, message.content, settings)
+        if ai_called:
+            self._bump(message.guild.id, "ai_calls")
+        if ai_error:
+            self._bump(message.guild.id, "ai_failures")
+            self._set_last_error(message.guild.id, ai_error)
+
         if not decision.violation or decision.confidence < settings.confidence_threshold:
             return
 
+        self._bump(message.guild.id, "violations")
         recent = await self.bot.store.count_recent_infractions(message.guild.id, message.author.id)
         timeout_minutes = self._effective_timeout(settings, recent)
         action_parts: list[str] = []
@@ -224,18 +330,30 @@ class ModerationCog(commands.Cog):
         else:
             if settings.delete_messages:
                 try:
-                    await message.delete(reason="PrettyWords profanity filter")
+                    await message.delete()
                     action_parts.append("deleted")
+                    self._bump(message.guild.id, "deleted")
                 except discord.NotFound:
                     action_parts.append("already deleted")
                 except discord.Forbidden:
                     action_parts.append("delete failed: missing permission")
+                    self._bump(message.guild.id, "delete_failures")
                 except discord.HTTPException:
                     LOGGER.exception("Failed to delete message %s", message.id)
                     action_parts.append("delete failed")
+                    self._bump(message.guild.id, "delete_failures")
+                except TypeError:
+                    LOGGER.exception("Failed to delete message %s", message.id)
+                    action_parts.append("delete failed: incompatible discord library")
+                    self._bump(message.guild.id, "delete_failures")
 
             if timeout_minutes > 0 and isinstance(message.author, discord.Member):
-                action_parts.append(await self._timeout_member(message.author, timeout_minutes, decision.reason))
+                timeout_action = await self._timeout_member(message.author, timeout_minutes, decision.reason)
+                action_parts.append(timeout_action)
+                if timeout_action.startswith("timeout "):
+                    self._bump(message.guild.id, "timeouts")
+                elif timeout_action.startswith("timeout failed"):
+                    self._bump(message.guild.id, "timeout_failures")
 
         action = ", ".join(action_parts) or "logged"
         infraction_id = await self.bot.store.create_infraction(
@@ -376,6 +494,7 @@ class ModerationCog(commands.Cog):
         _provider, _model, scan_all = self.bot._effective_ai_settings(settings)
         embed.add_field(name="AI", value=self.bot._ai_label(settings) if settings.ai_enabled else "disabled", inline=True)
         embed.add_field(name="AI Scan All", value=str(scan_all), inline=True)
+        embed.add_field(name="Health Logs", value=str(settings.health_log_enabled), inline=True)
         embed.add_field(name="Dry Run", value=str(settings.dry_run), inline=True)
         embed.add_field(name="Timeout", value=f"{settings.timeout_minutes}m", inline=True)
         embed.add_field(name="Threshold", value=f"{settings.confidence_threshold:.2f}", inline=True)
@@ -387,7 +506,7 @@ class ModerationCog(commands.Cog):
         embed.add_field(name="Config Admins", value=str(len(config_admins)), inline=True)
         await send_interaction(interaction, embed=embed)
 
-    @filter.command(name="config-admin-add", description="Allow a Discord user ID to configure PrettyWords")
+    @admin.command(name="config-admin-add", description="Allow a Discord user ID to configure PrettyWords")
     @mod_only()
     @app_commands.describe(user_id="Discord user ID or mention")
     async def config_admin_add(self, interaction: discord.Interaction, user_id: str) -> None:
@@ -405,7 +524,7 @@ class ModerationCog(commands.Cog):
             f"{interaction.user} added `{parsed_user_id}`",
         )
 
-    @filter.command(name="config-admin-remove", description="Remove a PrettyWords config admin Discord ID")
+    @admin.command(name="config-admin-remove", description="Remove a PrettyWords config admin Discord ID")
     @mod_only()
     @app_commands.describe(user_id="Discord user ID or mention")
     async def config_admin_remove(self, interaction: discord.Interaction, user_id: str) -> None:
@@ -424,7 +543,7 @@ class ModerationCog(commands.Cog):
                 f"{interaction.user} removed `{parsed_user_id}`",
             )
 
-    @filter.command(name="config-admin-list", description="List PrettyWords config admin Discord IDs")
+    @admin.command(name="config-admin-list", description="List PrettyWords config admin Discord IDs")
     @mod_only()
     async def config_admin_list(self, interaction: discord.Interaction) -> None:
         admins = await self.bot.store.list_config_admins(interaction.guild_id)
@@ -439,9 +558,28 @@ class ModerationCog(commands.Cog):
     @filter.command(name="log-channel", description="제재/신고 로그 채널을 설정합니다")
     @mod_only()
     async def log_channel(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
-        await self.bot.store.update_settings(interaction.guild_id, log_channel_id=channel.id)
+        settings = await self.bot.store.update_settings(interaction.guild_id, log_channel_id=channel.id)
         await send_interaction(interaction, f"로그 채널 설정됨: {channel.mention}")
         await self._log_admin_event(interaction.guild, "Log Channel Updated", f"{interaction.user} set logs to {channel.mention}")
+        await self._send_health_log(interaction.guild, settings, title="PrettyWords Log Channel Connected")
+
+    @filter.command(name="health", description="Send current PrettyWords health to the log channel")
+    @mod_only()
+    async def health(self, interaction: discord.Interaction) -> None:
+        settings = await self.bot.store.get_settings(interaction.guild_id)
+        if not settings.log_channel_id:
+            await send_interaction(interaction, "로그 채널 먼저 설정 필요: /filter log-channel")
+            return
+        await self._send_health_log(interaction.guild, settings)
+        await send_interaction(interaction, "상태 로그 전송됨")
+
+    @filter.command(name="health-log", description="Enable or disable periodic health logs")
+    @mod_only()
+    async def health_log(self, interaction: discord.Interaction, enabled: bool) -> None:
+        settings = await self.bot.store.update_settings(interaction.guild_id, health_log_enabled=enabled)
+        await send_interaction(interaction, f"상태 로그: {enabled}")
+        if enabled and settings.log_channel_id:
+            await self._send_health_log(interaction.guild, settings, title="PrettyWords Health Logs Enabled")
 
     @filter.command(name="timeout", description="비속어 사용 시 타임아웃 시간을 설정합니다")
     @mod_only()

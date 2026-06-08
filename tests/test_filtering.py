@@ -10,6 +10,14 @@ def test_local_classifier_detects_compacted_registered_term():
     assert "ㅅㅂ" in decision.matched_terms
 
 
+def test_local_classifier_detects_seed_terms():
+    classifier = LocalClassifier()
+    decision = classifier.classify("\uc2dc \ubc1c", [], [])
+
+    assert decision.violation is True
+    assert "\uc2dc\ubc1c" in decision.matched_terms
+
+
 def test_allowed_term_overrides_local_match():
     classifier = LocalClassifier()
     decision = classifier.classify("문서 예시: ㅅㅂ", [ModerationTerm("ㅅㅂ", 2)], ["문서 예시"])

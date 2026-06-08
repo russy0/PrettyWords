@@ -30,6 +30,7 @@ class GuildSettings:
     ai_provider: str = ""
     ai_model: str = ""
     ai_scan_all: bool | None = None
+    health_log_enabled: bool = True
 
 
 @dataclass(slots=True)
@@ -87,7 +88,8 @@ class ModerationStore:
                     ai_enabled INTEGER NOT NULL DEFAULT 1,
                     ai_provider TEXT NOT NULL DEFAULT '',
                     ai_model TEXT NOT NULL DEFAULT '',
-                    ai_scan_all INTEGER
+                    ai_scan_all INTEGER,
+                    health_log_enabled INTEGER NOT NULL DEFAULT 1
                 );
 
                 CREATE TABLE IF NOT EXISTS disabled_channels (
@@ -193,6 +195,7 @@ class ModerationStore:
             self._ensure_column(conn, "guild_settings", "ai_provider", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "guild_settings", "ai_model", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "guild_settings", "ai_scan_all", "INTEGER")
+            self._ensure_column(conn, "guild_settings", "health_log_enabled", "INTEGER NOT NULL DEFAULT 1")
             conn.commit()
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -224,6 +227,7 @@ class ModerationStore:
             "ai_provider",
             "ai_model",
             "ai_scan_all",
+            "health_log_enabled",
         }
         unknown = set(fields) - allowed
         if unknown:
@@ -255,6 +259,7 @@ class ModerationStore:
             ai_provider=str(row["ai_provider"] or ""),
             ai_model=str(row["ai_model"] or ""),
             ai_scan_all=None if row["ai_scan_all"] is None else bool(row["ai_scan_all"]),
+            health_log_enabled=bool(row["health_log_enabled"]),
         )
 
     def _sqlite_value(self, value: Any) -> Any:

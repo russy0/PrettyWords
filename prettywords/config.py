@@ -63,7 +63,7 @@ def load_config() -> BotConfig:
         openai_model=os.getenv("OPENAI_MODEL", "gpt-5-nano"),
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/"),
         ollama_model=os.getenv("OLLAMA_MODEL", "qwen3:4b").strip(),
-        ollama_timeout_seconds=float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "12")),
+        ollama_timeout_seconds=float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "30")),
         ai_scan_all=_bool_env("AI_SCAN_ALL", False),
         sync_guild_id=int(guild_raw) if guild_raw else None,
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),

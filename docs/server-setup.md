@@ -84,7 +84,7 @@ BOT_ADMIN_IDS=your_discord_user_id
 AI_PROVIDER=ollama
 OLLAMA_BASE_URL=http://127.0.0.1:11434
 OLLAMA_MODEL=qwen3:4b
-OLLAMA_TIMEOUT_SECONDS=12
+OLLAMA_TIMEOUT_SECONDS=30
 AI_SCAN_ALL=false
 
 DATABASE_PATH=data/prettywords.sqlite3
@@ -123,9 +123,12 @@ Discord 서버에서:
 ```text
 /filter status
 /filter log-channel channel:#moderation-log
+/filter health
 /filter timeout minutes:10
-/filter config-admin-add user_id:123456789012345678
+/pw config-admin-add user_id:123456789012345678
 ```
+
+`/filter log-channel`을 설정하면 10분마다 health summary가 로그 채널에 전송됩니다. 너무 많으면 `/filter health-log enabled:false`로 끌 수 있습니다.
 
 문제 없으면 `Ctrl+C`로 중지하고 systemd 서비스로 등록합니다.
 
@@ -208,4 +211,3 @@ source .venv/bin/activate
 pip install -r requirements.txt
 sudo systemctl restart prettywords
 ```
-

@@ -62,6 +62,7 @@ def test_existing_database_gets_ai_columns():
             assert settings.ai_provider == ""
             assert settings.ai_model == ""
             assert settings.ai_scan_all is None
+            assert settings.health_log_enabled is True
             await store.close()
 
     asyncio.run(run())
