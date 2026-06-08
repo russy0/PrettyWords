@@ -14,13 +14,15 @@ from .filtering import ModerationDecision, ModerationTerm
 
 LOGGER = logging.getLogger(__name__)
 
+CATEGORY_VALUES = ["profanity", "sexual", "family_insult", "harassment", "hate", "threat", "other"]
+
 DECISION_SCHEMA = {
     "type": "object",
     "properties": {
         "violation": {"type": "boolean"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "severity": {"type": "integer", "minimum": 0, "maximum": 3},
-        "categories": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
+        "categories": {"type": "array", "items": {"type": "string", "enum": CATEGORY_VALUES}, "maxItems": 6},
         "matched_terms": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
         "reason": {"type": "string", "maxLength": 240},
         "suggested_action": {
@@ -43,6 +45,9 @@ DECISION_SCHEMA = {
 SYSTEM_PROMPT = (
     "You are a Discord moderation classifier for Korean and English servers. "
     "Detect profanity, masked profanity, insults, harassment, and demeaning language. "
+    "Use categories only from this taxonomy: profanity=general swearing, sexual=sexual remarks, "
+    "family_insult=insults targeting family/parents, harassment=personal insults or bullying, "
+    "hate=identity-based hate/discrimination, threat=threats of harm, other=policy violation not covered. "
     "Do not flag benign education, quoting for moderation, reclaimed terms, or clean jokes. "
     "Use custom blocked terms as strong policy, allowed terms as exceptions, and examples as learning context. "
     "Return only JSON matching the schema. No markdown."
@@ -53,7 +58,8 @@ BATCH_SYSTEM_PROMPT = (
     "You will receive a JSON object with a 'messages' array; each entry has a unique integer 'index' "
     "and a 'message' string. Classify EVERY message independently — never let one message's content "
     "influence another's verdict. Detect profanity, masked profanity, insults, harassment, and demeaning "
-    "language. Do not flag benign education, quoting for moderation, reclaimed terms, or clean jokes. "
+    "language. Use categories only from this taxonomy: profanity, sexual, family_insult, harassment, hate, "
+    "threat, other. Do not flag benign education, quoting for moderation, reclaimed terms, or clean jokes. "
     "Use custom blocked terms as strong policy, allowed terms as exceptions, and examples as learning context. "
     "Return only JSON matching the schema: an object with a 'decisions' array containing exactly one "
     "decision object per input message, each carrying the same 'index' as its source message so results "
@@ -118,7 +124,8 @@ class AIContext:
 def _context_payload(context: AIContext) -> dict[str, object]:
     return {
         "custom_blocked_terms": [
-            {"term": term.term, "severity": term.severity} for term in context.blocked_terms[:80]
+            {"term": term.term, "severity": term.severity, "category": term.category}
+            for term in context.blocked_terms[:80]
         ],
         "allowed_terms": context.allowed_terms[:80],
         "confirmed_bad_examples": context.confirmed_examples[:8],

@@ -20,6 +20,40 @@ LEET_TABLE = str.maketrans(
     }
 )
 
+CATEGORY_LABELS = {
+    "profanity": "욕설",
+    "sexual": "성적발언",
+    "family_insult": "패드립",
+    "harassment": "괴롭힘/모욕",
+    "hate": "혐오/차별",
+    "threat": "위협",
+    "other": "기타",
+}
+
+CATEGORY_ALIASES = {
+    "욕설": "profanity",
+    "비속어": "profanity",
+    "profanity": "profanity",
+    "sexual": "sexual",
+    "성적": "sexual",
+    "성적발언": "sexual",
+    "섹드립": "sexual",
+    "패드립": "family_insult",
+    "family": "family_insult",
+    "family_insult": "family_insult",
+    "괴롭힘": "harassment",
+    "모욕": "harassment",
+    "harassment": "harassment",
+    "혐오": "hate",
+    "차별": "hate",
+    "hate": "hate",
+    "위협": "threat",
+    "협박": "threat",
+    "threat": "threat",
+    "기타": "other",
+    "other": "other",
+}
+
 DEFAULT_BLOCKED_TERMS = (
     # \u2500\u2500 \uc2dc\ubc1c \uacc4\uc5f4 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     ("\uc2dc\ubc1c", 3),
@@ -90,12 +124,72 @@ DEFAULT_BLOCKED_TERMS = (
     ("moron", 1),
 )
 
+SEXUAL_SEED_TERMS = {
+    "\uc8f5",
+    "\uc8f6",
+    "dick",
+}
+
+FAMILY_INSULT_SEED_TERMS = {
+    "\uc560\ubbf8",
+    "\ub290\uae08",
+    "\ub290\uadf8\ubbf8",
+    "\ub2c8\uc560\ubbf8",
+    "\ub2c8\uc5d0\ubbf8",
+}
+
+HARASSMENT_SEED_TERMS = {
+    "\ubcd1\uc2e0",
+    "\ube05\uc2e0",
+    "\ubd79\uc2e0",
+    "\ubcd1\uc270",
+    "\u3142\u3145",
+    "\uac1c\uc0c8\ub07c",
+    "\uac1c\uc0c8",
+    "\uac1c\uc0c9\uae30",
+    "\uac1c\uc138\ub07c",
+    "\uac1c\uc250\ub07c",
+    "\uc0c8\ub07c",
+    "\uc0c9\uae30",
+    "\uc138\ub07c",
+    "\uc0c9\ud788",
+    "\ubbf8\uce5c\ub188",
+    "\ubbf8\uce5c\ub144",
+    "\ubbf8\uce5c\uc0c8\ub07c",
+    "bitch",
+    "asshole",
+    "idiot",
+    "moron",
+}
+
+
+def normalize_category(category: str | None) -> str:
+    if not category:
+        return "profanity"
+    return CATEGORY_ALIASES.get(category.strip().lower(), category.strip().lower() or "profanity")
+
+
+def category_label(category: str) -> str:
+    normalized = normalize_category(category)
+    return CATEGORY_LABELS.get(normalized, normalized)
+
+
+def seed_category(term: str) -> str:
+    if term in SEXUAL_SEED_TERMS:
+        return "sexual"
+    if term in FAMILY_INSULT_SEED_TERMS:
+        return "family_insult"
+    if term in HARASSMENT_SEED_TERMS:
+        return "harassment"
+    return "profanity"
+
 
 @dataclass(frozen=True, slots=True)
 class ModerationTerm:
     term: str
     severity: int = 2
     notes: str = ""
+    category: str = "profanity"
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,7 +268,9 @@ class LocalClassifier:
                 )
 
         all_terms = list(blocked_terms)
-        all_terms.extend(ModerationTerm(term, severity) for term, severity in DEFAULT_BLOCKED_TERMS)
+        all_terms.extend(
+            ModerationTerm(term, severity, category=seed_category(term)) for term, severity in DEFAULT_BLOCKED_TERMS
+        )
 
         matched: list[ModerationTerm] = []
         for term in all_terms:
@@ -191,12 +287,13 @@ class LocalClassifier:
             )
 
         severity = max(max(term.severity, 1) for term in matched)
+        categories = tuple(dict.fromkeys(normalize_category(term.category) for term in matched))
         confidence = min(0.99, 0.68 + (0.08 * len(matched)) + (0.07 * severity))
         return ModerationDecision(
             violation=True,
             confidence=confidence,
             severity=severity,
-            categories=("profanity", "manual_or_seed_term"),
+            categories=categories or ("profanity",),
             matched_terms=tuple(term.term for term in matched[:8]),
             reason="Blocked term matched after normalization.",
             source="local",

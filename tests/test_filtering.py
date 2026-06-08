@@ -3,7 +3,7 @@ from prettywords.filtering import LocalClassifier, ModerationTerm, combine_decis
 
 def test_local_classifier_detects_compacted_registered_term():
     classifier = LocalClassifier()
-    decision = classifier.classify("나쁜 말: ㅅ ㅂ", [ModerationTerm("ㅅㅂ", 2)], [])
+    decision = classifier.classify("나쁜 말: ㅅ ㅂ", [ModerationTerm("ㅅㅂ", 2, category="profanity")], [])
 
     assert decision.violation is True
     assert decision.severity >= 2
@@ -16,6 +16,16 @@ def test_local_classifier_detects_seed_terms():
 
     assert decision.violation is True
     assert "\uc2dc\ubc1c" in decision.matched_terms
+    assert "profanity" in decision.categories
+
+
+def test_local_classifier_detects_seed_categories():
+    classifier = LocalClassifier()
+    family = classifier.classify("\ub2c8\uc560\ubbf8", [], [])
+    sexual = classifier.classify("\uc8f5", [], [])
+
+    assert "family_insult" in family.categories
+    assert "sexual" in sexual.categories
 
 
 def test_allowed_term_overrides_local_match():

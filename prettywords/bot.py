@@ -12,12 +12,25 @@ from discord.ext import commands, tasks
 
 from .ai import AIContext, GroqClassifier, OllamaClassifier, OpenAIClassifier, RateLimitedError
 from .config import BotConfig, load_config
-from .filtering import LocalClassifier, ModerationDecision, combine_decisions, message_fingerprint
+from .filtering import (
+    CATEGORY_LABELS,
+    LocalClassifier,
+    ModerationDecision,
+    category_label,
+    compact_text,
+    combine_decisions,
+    message_fingerprint,
+    normalize_category,
+)
 from .storage import GuildSettings, ModerationStore
 
 
 LOGGER = logging.getLogger(__name__)
 MAX_TIMEOUT_MINUTES = 28 * 24 * 60
+CATEGORY_CHOICES = [
+    app_commands.Choice(name=f"{label} ({value})", value=value)
+    for value, label in CATEGORY_LABELS.items()
+]
 
 
 def _parse_discord_id(value: str) -> int:
@@ -267,7 +280,7 @@ class ModerationCog(commands.Cog):
     async def health_heartbeat(self) -> None:
         for guild in self.bot.guilds:
             settings = await self.bot.store.get_settings(guild.id)
-            if not settings.health_log_enabled or not settings.log_channel_id:
+            if not settings.health_log_enabled or not (settings.health_log_channel_id or settings.log_channel_id):
                 continue
             await self._send_health_log(guild, settings, title="PrettyWords Health")
 
@@ -299,7 +312,8 @@ class ModerationCog(commands.Cog):
         *,
         title: str = "PrettyWords Health",
     ) -> None:
-        channel = guild.get_channel(settings.log_channel_id) if settings.log_channel_id else None
+        channel_id = settings.health_log_channel_id or settings.log_channel_id
+        channel = guild.get_channel(channel_id) if channel_id else None
         if not isinstance(channel, discord.abc.Messageable):
             return
 
@@ -778,15 +792,24 @@ class ModerationCog(commands.Cog):
             color=discord.Color.orange(),
             description=decision.reason[:350] or "Policy violation detected.",
         )
-        embed.add_field(name="User", value=f"{message.author} (`{message.author.id}`)", inline=False)
+        embed.add_field(
+            name="User",
+            value=f"{message.author.mention} {message.author} (`{message.author.id}`)",
+            inline=False,
+        )
         embed.add_field(name="Channel", value=message.channel.mention, inline=True)
         embed.add_field(name="Action", value=action, inline=True)
         embed.add_field(name="Timeout", value=f"{timeout_minutes}m", inline=True)
         embed.add_field(name="Confidence", value=f"{decision.confidence:.2f}", inline=True)
         embed.add_field(name="Severity", value=str(decision.severity), inline=True)
         embed.add_field(name="Source", value=decision.source, inline=True)
+        embed.add_field(name="Message Link", value=f"[Jump]({message.jump_url})", inline=False)
         if decision.categories:
-            embed.add_field(name="Categories", value=", ".join(decision.categories)[:250], inline=False)
+            embed.add_field(
+                name="Categories",
+                value=", ".join(category_label(category) for category in decision.categories)[:250],
+                inline=False,
+            )
         if decision.matched_terms:
             embed.add_field(name="Matched", value=", ".join(decision.matched_terms)[:250], inline=False)
         embed.add_field(name="Message", value=message.content[:900] or "(empty)", inline=False)
@@ -821,7 +844,8 @@ class ModerationCog(commands.Cog):
             await user.send(
                 f"PrettyWords case #{infraction_id}: 서버 규칙 위반 가능성이 감지되었습니다. "
                 f"타임아웃: {timeout_minutes}분. 사유: {reason[:250]} "
-                f"오탐이면 서버에서 `/filter report case_id:{infraction_id}` 명령으로 신고하세요."
+                f"오탐이면 서버에서 `/filter report case_id:{infraction_id}` 명령으로 이의제기하세요. "
+                "봇 관리자가 승인해야 학습에 반영됩니다."
             )
         except discord.HTTPException:
             return
@@ -845,6 +869,16 @@ class ModerationCog(commands.Cog):
         embed.add_field(name="Threshold", value=f"{settings.confidence_threshold:.2f}", inline=True)
         embed.add_field(name="Escalate", value=str(settings.escalate), inline=True)
         embed.add_field(name="Log Channel", value=f"<#{settings.log_channel_id}>" if settings.log_channel_id else "not set", inline=False)
+        health_channel_value = (
+            f"<#{settings.health_log_channel_id}>"
+            if settings.health_log_channel_id
+            else (f"log channel (<#{settings.log_channel_id}>)" if settings.log_channel_id else "not set")
+        )
+        embed.add_field(
+            name="Health Channel",
+            value=health_channel_value,
+            inline=False,
+        )
         embed.add_field(name="Disabled Channels", value=", ".join(f"<#{cid}>" for cid in disabled) or "none", inline=False)
         embed.add_field(name="Custom Blocked Terms", value=str(len(blocked)), inline=True)
         embed.add_field(name="Allowed Terms", value=str(len(allowed)), inline=True)
@@ -906,14 +940,20 @@ class ModerationCog(commands.Cog):
         settings = await self.bot.store.update_settings(interaction.guild_id, log_channel_id=channel.id)
         await send_interaction(interaction, f"로그 채널 설정됨: {channel.mention}")
         await self._log_admin_event(interaction.guild, "Log Channel Updated", f"{interaction.user} set logs to {channel.mention}")
-        await self._send_health_log(interaction.guild, settings, title="PrettyWords Log Channel Connected")
+
+    @filter.command(name="health-log-channel", description="상태 로그 전용 채널을 설정합니다")
+    @mod_only()
+    async def health_log_channel(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
+        settings = await self.bot.store.update_settings(interaction.guild_id, health_log_channel_id=channel.id)
+        await send_interaction(interaction, f"상태 로그 채널 설정됨: {channel.mention}")
+        await self._send_health_log(interaction.guild, settings, title="PrettyWords Health Channel Connected")
 
     @filter.command(name="health", description="Send current PrettyWords health to the log channel")
     @mod_only()
     async def health(self, interaction: discord.Interaction) -> None:
         settings = await self.bot.store.get_settings(interaction.guild_id)
-        if not settings.log_channel_id:
-            await send_interaction(interaction, "로그 채널 먼저 설정 필요: /filter log-channel")
+        if not (settings.health_log_channel_id or settings.log_channel_id):
+            await send_interaction(interaction, "상태 로그 채널 먼저 설정 필요: /filter health-log-channel")
             return
         await self._send_health_log(interaction.guild, settings)
         await send_interaction(interaction, "상태 로그 전송됨")
@@ -923,7 +963,7 @@ class ModerationCog(commands.Cog):
     async def health_log(self, interaction: discord.Interaction, enabled: bool) -> None:
         settings = await self.bot.store.update_settings(interaction.guild_id, health_log_enabled=enabled)
         await send_interaction(interaction, f"상태 로그: {enabled}")
-        if enabled and settings.log_channel_id:
+        if enabled and (settings.health_log_channel_id or settings.log_channel_id):
             await self._send_health_log(interaction.guild, settings, title="PrettyWords Health Logs Enabled")
 
     @filter.command(name="timeout", description="비속어 사용 시 타임아웃 시간을 설정합니다")
@@ -1053,29 +1093,124 @@ class ModerationCog(commands.Cog):
 
     @filter.command(name="add-word", description="서버 전용 비속어/금지어를 등록합니다")
     @mod_only()
+    @app_commands.choices(category=CATEGORY_CHOICES)
     async def add_word(
         self,
         interaction: discord.Interaction,
         term: str,
         severity: app_commands.Range[int, 1, 3] = 2,
+        category: str = "profanity",
         notes: Optional[str] = None,
     ) -> None:
-        await self.bot.store.add_blocked_term(interaction.guild_id, term, int(severity), interaction.user.id, notes or "")
+        normalized_category = normalize_category(category)
+        await self.bot.store.add_blocked_term(
+            interaction.guild_id,
+            term,
+            int(severity),
+            interaction.user.id,
+            notes or "",
+            category=normalized_category,
+        )
         await self.bot.store.add_learning_event(
             guild_id=interaction.guild_id,
             label="confirmed_bad",
             source_type="manual_term",
             content=term,
             term=term,
+            category=normalized_category,
             created_by=interaction.user.id,
         )
-        await send_interaction(interaction, f"등록됨: `{term}` severity={severity}")
+        await send_interaction(
+            interaction,
+            f"등록됨: `{term}` category={category_label(normalized_category)} severity={severity}",
+        )
 
     @filter.command(name="remove-word", description="서버 전용 금지어를 제거합니다")
     @mod_only()
     async def remove_word(self, interaction: discord.Interaction, term: str) -> None:
         count = await self.bot.store.remove_blocked_term(interaction.guild_id, term)
         await send_interaction(interaction, "제거됨" if count else "등록된 항목 없음")
+
+    @filter.command(name="learn-message", description="메시지 ID와 욕설 구간을 카테고리 학습 데이터로 등록합니다")
+    @mod_only()
+    @app_commands.choices(category=CATEGORY_CHOICES)
+    @app_commands.describe(
+        message_id="학습할 Discord 메시지 ID",
+        term="메시지 안에서 비속어인 부분",
+        category="비속어 카테고리",
+        channel="메시지가 있는 채널. 비우면 현재 채널",
+    )
+    async def learn_message(
+        self,
+        interaction: discord.Interaction,
+        message_id: str,
+        term: str,
+        category: str,
+        severity: app_commands.Range[int, 1, 3] = 2,
+        channel: Optional[discord.TextChannel] = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            parsed_message_id = _parse_discord_id(message_id)
+        except ValueError:
+            await interaction.followup.send("유효한 메시지 ID 필요.", ephemeral=True)
+            return
+
+        target_channel = channel or interaction.channel
+        if not hasattr(target_channel, "fetch_message"):
+            await interaction.followup.send("메시지를 가져올 수 있는 텍스트 채널 필요.", ephemeral=True)
+            return
+
+        try:
+            target_message = await target_channel.fetch_message(parsed_message_id)
+        except discord.NotFound:
+            await interaction.followup.send("메시지를 찾을 수 없음.", ephemeral=True)
+            return
+        except discord.Forbidden:
+            await interaction.followup.send("해당 채널 메시지 읽기 권한 없음.", ephemeral=True)
+            return
+        except discord.HTTPException:
+            LOGGER.exception("Failed to fetch message for learning")
+            await interaction.followup.send("메시지 조회 실패. 로그 확인 필요.", ephemeral=True)
+            return
+
+        normalized_category = normalize_category(category)
+        term_found = compact_text(term) in compact_text(target_message.content)
+        await self.bot.store.add_blocked_term(
+            interaction.guild_id,
+            term,
+            int(severity),
+            interaction.user.id,
+            f"learned from message {target_message.id}",
+            category=normalized_category,
+        )
+        await self.bot.store.add_learning_event(
+            guild_id=interaction.guild_id,
+            label="confirmed_bad",
+            source_type="message",
+            source_id=target_message.id,
+            content=target_message.content,
+            term=term,
+            category=normalized_category,
+            created_by=interaction.user.id,
+        )
+
+        note = "" if term_found else "\n주의: term이 메시지에 정확히 포함되지는 않음. 우회표현이면 정상일 수 있음."
+        await interaction.followup.send(
+            (
+                f"학습됨: `{term}` → {category_label(normalized_category)} severity={severity}\n"
+                f"메시지: {target_message.jump_url}{note}"
+            ),
+            ephemeral=True,
+        )
+        await self._log_admin_event(
+            interaction.guild,
+            "Message Learned",
+            (
+                f"{interaction.user} learned `{term}` as {normalized_category} "
+                f"from [message]({target_message.jump_url})"
+            ),
+        )
 
     @filter.command(name="allow-word", description="오탐 방지용 허용어/문구를 등록합니다")
     @mod_only()
@@ -1109,7 +1244,7 @@ class ModerationCog(commands.Cog):
             infraction_id=case_id,
             message_id=parsed_message_id,
         )
-        await send_interaction(interaction, f"신고 접수됨: report #{report_id}")
+        await send_interaction(interaction, f"이의제기/신고 접수됨: report #{report_id}. 관리자 승인 후 학습됩니다.")
         await self._log_report(interaction, report_id, case_id, reason)
 
     async def _log_report(
@@ -1130,9 +1265,9 @@ class ModerationCog(commands.Cog):
             description=reason[:900],
             color=discord.Color.red(),
         )
-        embed.add_field(name="Reporter", value=f"{interaction.user} (`{interaction.user.id}`)", inline=False)
+        embed.add_field(name="Reporter", value=f"{interaction.user.mention} {interaction.user} (`{interaction.user.id}`)", inline=False)
         embed.add_field(name="Case", value=f"#{case_id}" if case_id else "not provided", inline=True)
-        embed.set_footer(text="/filter resolve-report 로 처리")
+        embed.set_footer(text="/filter resolve-report outcome:false_positive 승인 시 비속어 아님으로 학습")
         await channel.send(embed=embed)
 
     @filter.command(name="resolve-report", description="신고를 처리하고 AI 학습 데이터에 반영합니다")
@@ -1145,12 +1280,14 @@ class ModerationCog(commands.Cog):
             app_commands.Choice(name="기각", value="rejected"),
         ]
     )
+    @app_commands.choices(category=CATEGORY_CHOICES)
     async def resolve_report(
         self,
         interaction: discord.Interaction,
         report_id: int,
         outcome: str,
         term: Optional[str] = None,
+        category: str = "profanity",
     ) -> None:
         report = await self.bot.store.resolve_report(interaction.guild_id, report_id, outcome)
         if not report:
@@ -1174,9 +1311,11 @@ class ModerationCog(commands.Cog):
                 source_type="report",
                 source_id=report_id,
                 content=infraction.content,
+                category="false_positive",
                 created_by=interaction.user.id,
             )
         elif outcome == "confirmed" and infraction:
+            normalized_category = normalize_category(category)
             await self.bot.store.add_learning_event(
                 guild_id=interaction.guild_id,
                 label="confirmed_bad",
@@ -1184,10 +1323,18 @@ class ModerationCog(commands.Cog):
                 source_id=report_id,
                 content=infraction.content,
                 term=term,
+                category=normalized_category,
                 created_by=interaction.user.id,
             )
             if term:
-                await self.bot.store.add_blocked_term(interaction.guild_id, term, 2, interaction.user.id, "from report")
+                await self.bot.store.add_blocked_term(
+                    interaction.guild_id,
+                    term,
+                    2,
+                    interaction.user.id,
+                    "from report",
+                    category=normalized_category,
+                )
 
         await send_interaction(interaction, f"report #{report_id} 처리됨: {outcome}")
 

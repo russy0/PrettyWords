@@ -123,12 +123,27 @@ Discord 서버에서:
 ```text
 /filter status
 /filter log-channel channel:#moderation-log
+/filter health-log-channel channel:#bot-health
 /filter health
 /filter timeout minutes:10
 /pw config-admin-add user_id:123456789012345678
 ```
 
-`/filter log-channel`을 설정하면 10분마다 health summary가 로그 채널에 전송됩니다. 너무 많으면 `/filter health-log enabled:false`로 끌 수 있습니다.
+`/filter health-log-channel`을 설정하면 10분마다 health summary가 해당 채널에 전송됩니다. health 채널을 따로 지정하지 않으면 기존 제재 로그 채널로 fallback됩니다. 너무 많으면 `/filter health-log enabled:false`로 끌 수 있습니다.
+
+카테고리 학습 예시:
+
+```text
+/filter add-word term:... category:family_insult severity:3
+/filter learn-message message_id:123456789012345678 term:... category:sexual severity:2 channel:#general
+```
+
+오탐 이의제기는 사용자가 `/filter report`로 열고, 봇 config admin이 승인해야 학습됩니다.
+
+```text
+/filter report case_id:12 reason:오탐입니다
+/filter resolve-report report_id:3 outcome:false_positive
+```
 
 문제 없으면 `Ctrl+C`로 중지하고 systemd 서비스로 등록합니다.
 
