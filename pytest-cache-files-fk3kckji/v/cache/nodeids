@@ -1,0 +1,10 @@
+[
+  "tests/test_filtering.py::test_ai_false_positive_can_override_local_match",
+  "tests/test_filtering.py::test_allowed_term_overrides_local_match",
+  "tests/test_filtering.py::test_fingerprint_ignores_spacing_and_repeats",
+  "tests/test_filtering.py::test_local_classifier_detects_compacted_registered_term",
+  "tests/test_filtering.py::test_local_classifier_detects_seed_terms",
+  "tests/test_storage.py::test_ai_settings_persist_and_reset",
+  "tests/test_storage.py::test_config_admins_persist",
+  "tests/test_storage.py::test_existing_database_gets_ai_columns"
+]
