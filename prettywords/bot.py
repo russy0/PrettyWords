@@ -388,13 +388,38 @@ class ModerationCog(commands.Cog):
         self._bump(message.guild.id, "checked")
         self._mark_scan(message.guild.id)
 
+        LOGGER.debug(
+            "[%s] checking: %s#%s | %.80r",
+            message.guild.name,
+            message.author,
+            getattr(message.channel, "name", message.channel.id),
+            message.content,
+        )
+
         blocked_terms = await self.bot.store.list_blocked_terms(message.guild.id)
         allowed_terms = await self.bot.store.list_allowed_terms(message.guild.id)
         local = self.bot.local_classifier.classify(message.content, blocked_terms, allowed_terms)
 
+        LOGGER.debug(
+            "[%s] local: violation=%s conf=%.2f matched=%s",
+            message.guild.name,
+            local.violation,
+            local.confidence,
+            list(local.matched_terms) or "[]",
+        )
+
         _provider, _model, scan_all = self.bot._effective_ai_settings(settings)
         classifier, batchable = self._resolve_ai_classifier(settings)
         should_call_ai = bool(settings.ai_enabled and classifier is not None and (scan_all or local.violation))
+
+        LOGGER.debug(
+            "[%s] AI: provider=%s batchable=%s should_call=%s ai_enabled=%s",
+            message.guild.name,
+            getattr(classifier, "provider_name", "none") if classifier else "none",
+            batchable,
+            should_call_ai,
+            settings.ai_enabled,
+        )
 
         if should_call_ai and batchable:
             # Groq is active: queue this message and let it ride out in a batch
@@ -408,10 +433,30 @@ class ModerationCog(commands.Cog):
         ai_error = ""
         if should_call_ai:
             ai_called = True
+            provider_name = getattr(classifier, "provider_name", "?")
+            LOGGER.info(
+                "[%s] AI call (%s): %s#%s | %.80r",
+                message.guild.name,
+                provider_name,
+                message.author,
+                getattr(message.channel, "name", message.channel.id),
+                message.content,
+            )
             context = await self._build_ai_context(message.guild.id, blocked_terms, allowed_terms)
             ai_decision = await classifier.classify(message.content, context)
             if ai_decision is None:
                 ai_error = getattr(classifier, "last_error", "") or "AI returned no decision"
+                LOGGER.warning("[%s] AI failure (%s): %s", message.guild.name, provider_name, ai_error)
+            else:
+                LOGGER.info(
+                    "[%s] AI result (%s): violation=%s conf=%.2f severity=%d reason=%.120s",
+                    message.guild.name,
+                    provider_name,
+                    ai_decision.violation,
+                    ai_decision.confidence,
+                    ai_decision.severity,
+                    ai_decision.reason,
+                )
 
         if ai_called:
             self._bump(message.guild.id, "ai_calls")
@@ -420,6 +465,14 @@ class ModerationCog(commands.Cog):
             self._set_last_error(message.guild.id, ai_error)
 
         decision = combine_decisions(local, ai_decision, settings.confidence_threshold)
+        LOGGER.debug(
+            "[%s] combined: source=%s violation=%s conf=%.2f threshold=%.2f",
+            message.guild.name,
+            decision.source,
+            decision.violation,
+            decision.confidence,
+            settings.confidence_threshold,
+        )
         await self._finish_moderation(message, decision, settings)
 
     async def _queue_for_batch(
@@ -433,6 +486,14 @@ class ModerationCog(commands.Cog):
                 local=local,
                 queued_at=datetime.now(timezone.utc),
             )
+        )
+        LOGGER.debug(
+            "[%s] queued for Groq batch: depth=%d/%d | %s | %.60r",
+            message.guild.name,
+            len(queue),
+            self.bot.config.groq_batch_size,
+            message.author,
+            message.content,
         )
         if len(queue) >= self.bot.config.groq_batch_size:
             await self._flush_groq_queue(message.guild.id)
@@ -468,6 +529,16 @@ class ModerationCog(commands.Cog):
             # changed, or a Groq cooldown may have just kicked in/expired.
             current_settings = await self.bot.store.get_settings(guild_id)
             classifier, batchable = self._resolve_ai_classifier(current_settings)
+            provider_name = getattr(classifier, "provider_name", "none") if classifier else "none"
+
+            LOGGER.info(
+                "[guild:%d] flushing batch: %d messages | provider=%s batchable=%s force=%s",
+                guild_id,
+                len(items),
+                provider_name,
+                batchable,
+                force,
+            )
 
             if classifier is not None and batchable:
                 try:
@@ -475,15 +546,27 @@ class ModerationCog(commands.Cog):
                         [item.message.content for item in items], context
                     )
                 except RateLimitedError as exc:
+                    LOGGER.warning(
+                        "[guild:%d] all Groq keys rate limited; entering cooldown and falling back to Ollama",
+                        guild_id,
+                    )
                     self.bot._enter_groq_cooldown(exc.retry_after)
                     await self._finish_batch_with_fallback(items, context)
                     return
+                violations = sum(1 for d in decisions if d and d.violation)
+                LOGGER.info(
+                    "[guild:%d] Groq batch done: %d decisions | %d violations",
+                    guild_id,
+                    len(decisions),
+                    violations,
+                )
                 for item, ai_decision in zip(items, decisions):
                     await self._complete_classification(item, ai_decision, classifier)
                 return
 
             # Active classifier isn't (or no longer is) Groq batching — e.g. we
             # just entered a cooldown and fell back to Ollama. Process one by one.
+            LOGGER.debug("[guild:%d] batch falling back to one-by-one via %s", guild_id, provider_name)
             for item in items:
                 ai_decision = await classifier.classify(item.message.content, context) if classifier else None
                 await self._complete_classification(item, ai_decision, classifier)
@@ -492,6 +575,11 @@ class ModerationCog(commands.Cog):
         self, items: list[_PendingClassification], context: AIContext
     ) -> None:
         fallback = self.bot._groq_fallback_classifier()
+        LOGGER.info(
+            "Groq rate-limit fallback: processing %d messages via %s",
+            len(items),
+            getattr(fallback, "provider_name", "none") if fallback else "none (no fallback)",
+        )
         for item in items:
             ai_decision = None
             if fallback is not None:
@@ -512,14 +600,39 @@ class ModerationCog(commands.Cog):
             return
 
         ai_called = classifier is not None
+        provider_name = getattr(classifier, "provider_name", "?") if classifier else "none"
         if ai_called:
             self._bump(guild_id, "ai_calls")
             if ai_decision is None:
                 ai_error = getattr(classifier, "last_error", "") or "AI returned no decision"
                 self._bump(guild_id, "ai_failures")
                 self._set_last_error(guild_id, ai_error)
+                LOGGER.warning(
+                    "[guild:%d] AI failure (%s): %s | %.60r",
+                    guild_id,
+                    provider_name,
+                    ai_error,
+                    item.message.content,
+                )
+            else:
+                LOGGER.info(
+                    "[guild:%d] AI result (%s): violation=%s conf=%.2f severity=%d reason=%.120s",
+                    guild_id,
+                    provider_name,
+                    ai_decision.violation,
+                    ai_decision.confidence,
+                    ai_decision.severity,
+                    ai_decision.reason,
+                )
 
         decision = combine_decisions(item.local, ai_decision, item.settings.confidence_threshold)
+        LOGGER.debug(
+            "[guild:%d] combined: source=%s violation=%s conf=%.2f",
+            guild_id,
+            decision.source,
+            decision.violation,
+            decision.confidence,
+        )
         await self._finish_moderation(item.message, decision, item.settings)
 
     async def _finish_moderation(
@@ -529,6 +642,16 @@ class ModerationCog(commands.Cog):
         settings: GuildSettings,
     ) -> None:
         if not decision.violation or decision.confidence < settings.confidence_threshold:
+            LOGGER.debug(
+                "[%s] pass: source=%s violation=%s conf=%.2f threshold=%.2f | %s | %.60r",
+                message.guild.name,
+                decision.source,
+                decision.violation,
+                decision.confidence,
+                settings.confidence_threshold,
+                message.author,
+                message.content,
+            )
             return
 
         fingerprint = message_fingerprint(message.content)
@@ -568,6 +691,16 @@ class ModerationCog(commands.Cog):
                     self._bump(message.guild.id, "timeout_failures")
 
         action = ", ".join(action_parts) or "logged"
+        LOGGER.info(
+            "[%s] VIOLATION: %s | source=%s conf=%.2f severity=%d | action=%s | %.80r",
+            message.guild.name,
+            message.author,
+            decision.source,
+            decision.confidence,
+            decision.severity,
+            action,
+            message.content,
+        )
         infraction_id = await self.bot.store.create_infraction(
             guild_id=message.guild.id,
             channel_id=message.channel.id,

@@ -219,12 +219,19 @@ class OllamaClassifier:
         self.last_error = ""
 
     async def classify(self, message: str, context: AIContext) -> ModerationDecision | None:
+        LOGGER.debug("Ollama request: model=%s | %.80r", self.model, message)
         try:
-            return await asyncio.to_thread(self._classify_sync, message, context)
+            result = await asyncio.to_thread(self._classify_sync, message, context)
         except Exception as exc:
             self.last_error = f"{exc.__class__.__name__}: {exc}"
             LOGGER.exception("Ollama moderation request failed")
             return None
+        if result is not None:
+            LOGGER.debug(
+                "Ollama result: violation=%s conf=%.2f severity=%d reason=%.120s",
+                result.violation, result.confidence, result.severity, result.reason,
+            )
+        return result
 
     def _classify_sync(self, message: str, context: AIContext) -> ModerationDecision | None:
         self.last_error = ""
@@ -313,6 +320,9 @@ class GroqClassifier:
         self.model = model
         self.provider_name = "groq"
         self.last_error = ""
+        # Some Groq models don't support json_schema structured output.
+        # We start optimistic and downgrade to json_object on the first 400.
+        self._use_json_schema = True
 
     async def classify(self, message: str, context: AIContext) -> ModerationDecision | None:
         results = await self.classify_batch([message], context)
@@ -355,34 +365,51 @@ class GroqClassifier:
         if not messages:
             return []
 
-        from openai import RateLimitError
+        from openai import BadRequestError, RateLimitError
 
         self.last_error = ""
         payload = json.dumps(_batch_payload(messages, context), ensure_ascii=False)
-        request_kwargs = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": BATCH_SYSTEM_PROMPT},
-                {"role": "user", "content": payload},
-            ],
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "prettywords_moderation_batch",
-                    "strict": True,
-                    "schema": BATCH_DECISION_SCHEMA,
-                },
-            },
-        }
+
+        def _build_request_kwargs() -> dict:
+            base = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": BATCH_SYSTEM_PROMPT},
+                    {"role": "user", "content": payload},
+                ],
+            }
+            if self._use_json_schema:
+                base["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "prettywords_moderation_batch",
+                        "strict": True,
+                        "schema": BATCH_DECISION_SCHEMA,
+                    },
+                }
+            else:
+                base["response_format"] = {"type": "json_object"}
+            return base
 
         attempt_order = self._attempt_order()
+        ready_count = sum(
+            1 for i in attempt_order
+            if self._key_cooldowns[i] is None or self._key_cooldowns[i] <= datetime.now(timezone.utc)
+        )
+        LOGGER.debug(
+            "Groq batch request: %d messages | %d/%d keys available | model=%s | format=%s",
+            len(messages), ready_count, self._key_count, self.model,
+            "json_schema" if self._use_json_schema else "json_object",
+        )
         rate_limited_keys = 0
         best_retry_after: float | None = None
         response = None
 
         for key_index in attempt_order:
             try:
-                response = await self._clients[key_index].chat.completions.create(**request_kwargs)
+                response = await self._clients[key_index].chat.completions.create(
+                    **_build_request_kwargs()
+                )
             except RateLimitError as exc:
                 retry_after = _retry_after_seconds(exc)
                 self._mark_rate_limited(key_index, retry_after)
@@ -393,6 +420,26 @@ class GroqClassifier:
                     "Groq key #%d/%d rate limited; trying next key", key_index + 1, self._key_count
                 )
                 continue
+            except BadRequestError as exc:
+                if self._use_json_schema and "json_schema" in str(exc).lower():
+                    LOGGER.warning(
+                        "Model %s does not support json_schema; switching to json_object for all future requests",
+                        self.model,
+                    )
+                    self._use_json_schema = False
+                    try:
+                        response = await self._clients[key_index].chat.completions.create(
+                            **_build_request_kwargs()
+                        )
+                    except Exception:
+                        LOGGER.exception("Groq moderation batch request failed after json_object fallback")
+                        self.last_error = "Groq request failed"
+                        return [None] * len(messages)
+                    self._mark_success(key_index)
+                    break
+                LOGGER.error("Groq bad request: %s", exc)
+                self.last_error = f"Groq bad request: {exc}"
+                return [None] * len(messages)
             except Exception:
                 LOGGER.exception("Groq moderation batch request failed")
                 self.last_error = "Groq request failed"

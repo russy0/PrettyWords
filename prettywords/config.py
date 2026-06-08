@@ -84,7 +84,7 @@ def load_config() -> BotConfig:
         ollama_model=os.getenv("OLLAMA_MODEL", "qwen3:4b").strip(),
         ollama_timeout_seconds=float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "30")),
         groq_api_keys=_str_list_env("GROQ_API_KEY") or _str_list_env("GROQ_API_KEYS"),
-        groq_model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip(),
+        groq_model=os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct").strip(),
         groq_batch_size=max(1, int(os.getenv("GROQ_BATCH_SIZE", "30"))),
         groq_batch_window_seconds=float(os.getenv("GROQ_BATCH_WINDOW_SECONDS", "8")),
         groq_rate_limit_cooldown_seconds=float(os.getenv("GROQ_RATE_LIMIT_COOLDOWN_SECONDS", "60")),
