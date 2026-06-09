@@ -14,6 +14,7 @@ from .ai import AIContext, GroqClassifier, OllamaClassifier, OpenAIClassifier, R
 from .config import BotConfig, load_config
 from .filtering import (
     CATEGORY_LABELS,
+    DEFAULT_BLOCKED_TERMS,
     LocalClassifier,
     ModerationDecision,
     category_label,
@@ -456,7 +457,8 @@ class ModerationCog(commands.Cog):
 
         blocked_terms = await self.bot.store.list_blocked_terms(message.guild.id)
         allowed_terms = await self.bot.store.list_allowed_terms(message.guild.id)
-        local = self.bot.local_classifier.classify(message.content, blocked_terms, allowed_terms)
+        scan_content = self._mask_member_names(message)
+        local = self.bot.local_classifier.classify(scan_content, blocked_terms, allowed_terms)
 
         LOGGER.debug(
             "[%s] local: violation=%s conf=%.2f matched=%s",
@@ -781,10 +783,105 @@ class ModerationCog(commands.Cog):
                 content=message.content,
                 created_by=self.bot.user.id if self.bot.user else None,
             )
+            await self._auto_register_terms(message.guild.id, decision, infraction_id)
 
         await self._log_infraction(message, infraction_id, decision, action, timeout_minutes, settings)
         if settings.dm_users and not settings.dry_run:
             await self._dm_warning(message.author, infraction_id, timeout_minutes, decision.reason)
+
+    def _mask_member_names(self, message: discord.Message) -> str:
+        """Return message content with all known server member names replaced by spaces.
+
+        This prevents usernames/nicknames that happen to contain blocked words
+        from triggering false positives in the local keyword filter.
+        """
+        import re as _re
+
+        if not message.guild:
+            return message.content
+
+        # Collect names from cached members + message author + mentioned users.
+        members: list = list(message.guild.members) if message.guild.members else []
+        members.append(message.author)
+        members.extend(message.mentions)
+
+        names: set[str] = set()
+        for m in members:
+            for attr in ("display_name", "global_name", "name"):
+                val = getattr(m, attr, None)
+                if val and len(val) >= 2:
+                    names.add(val)
+
+        result = message.content
+        # Replace longest names first to avoid partial-match issues.
+        for name in sorted(names, key=len, reverse=True):
+            result = _re.sub(_re.escape(name), " ", result, flags=_re.IGNORECASE)
+
+        if result != message.content:
+            LOGGER.debug(
+                "[%s] name-masked for local filter: %.80r → %.80r",
+                message.guild.name,
+                message.content,
+                result,
+            )
+        return result
+
+    async def _auto_register_terms(
+        self,
+        guild_id: int,
+        decision: ModerationDecision,
+        infraction_id: int,
+    ) -> None:
+        """Auto-add AI-confirmed matched terms to the guild's blocked_terms table.
+
+        Only runs when the AI had high confidence (≥ 0.9) and the decision came
+        from an AI source.  Terms already in DEFAULT_BLOCKED_TERMS or already
+        registered for this guild are skipped.
+        """
+        if not decision.matched_terms:
+            return
+
+        default_terms = {term.lower() for term, _ in DEFAULT_BLOCKED_TERMS}
+        existing = {t.term.lower() for t in await self.bot.store.list_blocked_terms(guild_id)}
+
+        added: list[str] = []
+        for raw in decision.matched_terms:
+            term = raw.strip()
+            if not term or len(term) < 2:
+                continue
+            if term.lower() in default_terms or term.lower() in existing:
+                continue
+
+            severity = min(3, max(1, decision.severity))
+            category = decision.categories[0] if decision.categories else "profanity"
+            await self.bot.store.add_blocked_term(
+                guild_id,
+                term,
+                severity,
+                added_by=self.bot.user.id if self.bot.user else 0,
+                notes=f"auto from infraction #{infraction_id} (conf={decision.confidence:.2f})",
+                category=category,
+            )
+            await self.bot.store.add_learning_event(
+                guild_id=guild_id,
+                label="confirmed_bad",
+                source_type="infraction",
+                source_id=infraction_id,
+                content=term,
+                term=term,
+                created_by=self.bot.user.id if self.bot.user else None,
+            )
+            existing.add(term.lower())
+            added.append(term)
+
+        if added:
+            LOGGER.info(
+                "[guild:%d] auto-registered %d term(s) from infraction #%d: %s",
+                guild_id,
+                len(added),
+                infraction_id,
+                added,
+            )
 
     def _effective_timeout(self, settings: GuildSettings, recent_count: int) -> int:
         base = max(0, min(MAX_TIMEOUT_MINUTES, settings.timeout_minutes))
