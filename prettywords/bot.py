@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -99,18 +100,23 @@ async def _can_manage_bot_settings(interaction: discord.Interaction) -> bool:
     bot = interaction.client
     user_id = interaction.user.id
 
+    # 서버 오너 · 전역 봇 관리자 · Discord 관리자 권한은 항상 허용
     if getattr(interaction.guild, "owner_id", None) == user_id:
         return True
-
     if hasattr(bot, "config") and user_id in bot.config.bot_admin_ids:
         return True
+    if isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator:
+        return True
 
+    # 서버별 config_admin 등록 여부 확인
     if hasattr(bot, "store"):
         if await bot.store.is_config_admin(interaction.guild_id, user_id):
             return True
+        # config_admin이 한 명이라도 등록됐으면 manage_guild / moderate_members 권한만으로는 접근 불가
         if await bot.store.has_config_admins(interaction.guild_id):
             return False
 
+    # config_admin 미등록 시 Discord mod 권한으로 접근 허용
     return _is_mod_member(interaction.user)
 
 
@@ -272,6 +278,104 @@ class PrettyWordsBot(commands.Bot):
         await super().close()
 
 
+# ── Discord UI ─────────────────────────────────────────────────────────────────
+# custom_id 형식:
+#   pw_appeal:{guild_id}:{infraction_id}
+#   pw_resolve:{guild_id}:{report_id}:{outcome}
+# ModerationCog.on_interaction 에서 처리. 뷰는 표시용으로만 사용하며
+# add_view() 등록 없이도 봇 재시작 후 버튼이 동작함.
+
+class _AppealModal(discord.ui.Modal, title="이의제기"):
+    """DM 경고의 이의제기 버튼을 눌렀을 때 표시되는 모달."""
+
+    reason: discord.ui.TextInput = discord.ui.TextInput(
+        label="이의제기 사유",
+        placeholder="이 제재가 오탐지라고 생각하는 이유를 적어주세요.",
+        style=discord.TextStyle.paragraph,
+        max_length=500,
+        required=True,
+    )
+
+    def __init__(self, bot: "PrettyWordsBot", guild_id: int, infraction_id: int) -> None:
+        super().__init__()
+        self._pw_bot = bot
+        self._guild_id = guild_id
+        self._infraction_id = infraction_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        report_id = await self._pw_bot.store.create_report(
+            self._guild_id,
+            interaction.user.id,
+            self.reason.value,
+            infraction_id=self._infraction_id,
+        )
+        await interaction.response.send_message(
+            f"이의제기가 접수됐습니다 (신고 #{report_id}). 관리자 검토 후 처리됩니다.",
+            ephemeral=True,
+        )
+        # 로그 채널에 신고 embed + 처리 버튼 전달
+        guild = self._pw_bot.get_guild(self._guild_id)
+        if guild is None:
+            return
+        settings = await self._pw_bot.store.get_settings(self._guild_id)
+        if not settings.log_channel_id:
+            return
+        log_ch = guild.get_channel(settings.log_channel_id)
+        if not isinstance(log_ch, discord.abc.Messageable):
+            return
+        embed = discord.Embed(
+            title=f"PrettyWords 신고 #{report_id} (DM 이의제기)",
+            description=self.reason.value[:900],
+            color=discord.Color.red(),
+        )
+        embed.add_field(
+            name="신고자",
+            value=f"<@{interaction.user.id}> {interaction.user} (`{interaction.user.id}`)",
+            inline=False,
+        )
+        embed.add_field(name="제재 기록", value=f"#{self._infraction_id}", inline=True)
+        embed.set_footer(text="아래 버튼으로 처리하세요")
+        view = _ResolveReportView(self._guild_id, report_id)
+        try:
+            await log_ch.send(embed=embed, view=view)
+        except discord.HTTPException:
+            LOGGER.exception("Failed to send DM appeal log")
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        LOGGER.exception("AppealModal error: %s", error)
+        if not interaction.response.is_done():
+            await interaction.response.send_message("처리 중 오류가 발생했습니다.", ephemeral=True)
+
+
+class _AppealView(discord.ui.View):
+    """DM 경고 메시지에 첨부하는 이의제기 버튼."""
+
+    def __init__(self, guild_id: int, infraction_id: int) -> None:
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="✋  이의제기",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"pw_appeal:{guild_id}:{infraction_id}",
+        ))
+
+
+class _ResolveReportView(discord.ui.View):
+    """로그 채널 신고 embed에 첨부하는 처리 버튼들."""
+
+    def __init__(self, guild_id: int, report_id: int) -> None:
+        super().__init__(timeout=None)
+        for label, outcome, style in (
+            ("✅  오탐 처리", "false_positive", discord.ButtonStyle.success),
+            ("🔨  정상 제재", "confirmed", discord.ButtonStyle.danger),
+            ("❌  기각", "rejected", discord.ButtonStyle.secondary),
+        ):
+            self.add_item(discord.ui.Button(
+                label=label,
+                style=style,
+                custom_id=f"pw_resolve:{guild_id}:{report_id}:{outcome}",
+            ))
+
+
 class ModerationCog(commands.Cog):
     filter = app_commands.Group(name="filter", description="AI 비속어 필터 설정")
     admin = app_commands.Group(name="pw", description="PrettyWords 봇 관리")
@@ -419,6 +523,104 @@ class ModerationCog(commands.Cog):
             return self.bot._groq_fallback_classifier(), False
         classifier = self.bot._get_ai_classifier(settings)
         return classifier, isinstance(classifier, GroqClassifier)
+
+    @commands.Cog.listener()
+    async def on_interaction(self, interaction: discord.Interaction) -> None:
+        """pw_appeal / pw_resolve 버튼 처리."""
+        if interaction.type != discord.InteractionType.component:
+            return
+        cid: str = (interaction.data or {}).get("custom_id", "")
+        if cid.startswith("pw_appeal:"):
+            await self._handle_appeal_button(interaction, cid)
+        elif cid.startswith("pw_resolve:"):
+            await self._handle_resolve_button(interaction, cid)
+
+    async def _handle_appeal_button(
+        self, interaction: discord.Interaction, custom_id: str
+    ) -> None:
+        """DM 이의제기 버튼 → 모달 표시."""
+        try:
+            _, guild_id_s, infraction_id_s = custom_id.split(":", 2)
+            guild_id, infraction_id = int(guild_id_s), int(infraction_id_s)
+        except ValueError:
+            await interaction.response.send_message("잘못된 버튼입니다.", ephemeral=True)
+            return
+        await interaction.response.send_modal(
+            _AppealModal(self.bot, guild_id, infraction_id)
+        )
+
+    async def _handle_resolve_button(
+        self, interaction: discord.Interaction, custom_id: str
+    ) -> None:
+        """로그 채널 처리 버튼 → 신고 처리 + 버튼 비활성화."""
+        # 관리자 권한 확인 (빠른 응답 전에)
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("서버에서만 사용 가능합니다.", ephemeral=True)
+            return
+        if not await _can_manage_bot_settings(interaction):
+            await interaction.response.send_message("관리자 권한이 필요합니다.", ephemeral=True)
+            return
+
+        try:
+            _, guild_id_s, report_id_s, outcome = custom_id.split(":", 3)
+            guild_id, report_id = int(guild_id_s), int(report_id_s)
+        except ValueError:
+            await interaction.response.send_message("잘못된 버튼입니다.", ephemeral=True)
+            return
+
+        # DB 작업 전에 defer — 3초 응답 제한 초과 방지
+        await interaction.response.defer(ephemeral=True)
+
+        report = await self.bot.store.resolve_report(guild_id, report_id, outcome)
+        if not report:
+            await interaction.followup.send("신고를 찾을 수 없거나 이미 처리됐습니다.", ephemeral=True)
+            return
+
+        infraction = None
+        if report["infraction_id"]:
+            infraction = await self.bot.store.get_infraction(guild_id, int(report["infraction_id"]))
+
+        if outcome == "false_positive" and infraction:
+            await self.bot.store.add_allowed_hash(
+                guild_id, infraction.normalized_hash, interaction.user.id,
+                reason=f"신고 #{report_id}",
+            )
+            await self.bot.store.add_learning_event(
+                guild_id=guild_id, label="false_positive", source_type="report",
+                source_id=report_id, content=infraction.content,
+                category="false_positive", created_by=interaction.user.id,
+            )
+        elif outcome == "confirmed" and infraction:
+            await self.bot.store.add_learning_event(
+                guild_id=guild_id, label="confirmed_bad", source_type="report",
+                source_id=report_id, content=infraction.content,
+                category="profanity", created_by=interaction.user.id,
+            )
+
+        # 버튼 비활성화 — ActionRow.children 순회
+        if interaction.message:
+            disabled_view = discord.ui.View()
+            for action_row in (interaction.message.components or []):
+                for component in getattr(action_row, "children", []):
+                    if not hasattr(component, "custom_id"):
+                        continue
+                    disabled_view.add_item(discord.ui.Button(
+                        label=getattr(component, "label", ""),
+                        style=getattr(component, "style", discord.ButtonStyle.secondary),
+                        custom_id=component.custom_id,
+                        disabled=True,
+                    ))
+            try:
+                await interaction.message.edit(view=disabled_view)
+            except discord.HTTPException:
+                pass
+
+        outcome_text = _outcome_label(outcome)
+        await interaction.followup.send(f"신고 #{report_id} 처리됨: {outcome_text}", ephemeral=True)
+        LOGGER.info(
+            "[guild:%d] report #%d resolved via button: %s by %s",
+            guild_id, report_id, outcome, interaction.user,
+        )
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -787,7 +989,7 @@ class ModerationCog(commands.Cog):
 
         await self._log_infraction(message, infraction_id, decision, action, timeout_minutes, settings)
         if settings.dm_users and not settings.dry_run:
-            await self._dm_warning(message.author, infraction_id, timeout_minutes, decision.reason)
+            await self._dm_warning(message.author, infraction_id, timeout_minutes, decision.reason, guild_id=message.guild.id)
 
     def _mask_member_names(self, message: discord.Message) -> str:
         """Return message content with all known server member names replaced by spaces.
@@ -795,8 +997,6 @@ class ModerationCog(commands.Cog):
         This prevents usernames/nicknames that happen to contain blocked words
         from triggering false positives in the local keyword filter.
         """
-        import re as _re
-
         if not message.guild:
             return message.content
 
@@ -815,7 +1015,7 @@ class ModerationCog(commands.Cog):
         result = message.content
         # Replace longest names first to avoid partial-match issues.
         for name in sorted(names, key=len, reverse=True):
-            result = _re.sub(_re.escape(name), " ", result, flags=_re.IGNORECASE)
+            result = re.sub(re.escape(name), " ", result, flags=re.IGNORECASE)
 
         if result != message.content:
             LOGGER.debug(
@@ -847,7 +1047,9 @@ class ModerationCog(commands.Cog):
         added: list[str] = []
         for raw in decision.matched_terms:
             term = raw.strip()
-            if not term or len(term) < 2:
+            # 2음절 이하 단어는 자동 등록 안 함 — 한국어는 짧은 단어가
+            # 동사 어간·어미에 묻혀 오탐이 너무 많음 (예: "자지" → "자지마").
+            if not term or len(term) < 3:
                 continue
             if term.lower() in default_terms or term.lower() in existing:
                 continue
@@ -980,14 +1182,18 @@ class ModerationCog(commands.Cog):
         infraction_id: int,
         timeout_minutes: int,
         reason: str,
+        guild_id: int | None = None,
     ) -> None:
+        text = (
+            f"**PrettyWords 제재 기록 #{infraction_id}**: 서버 규칙 위반 가능성이 감지되었습니다.\n"
+            f"타임아웃: **{timeout_minutes}분** | 사유: {reason[:250]}\n"
+            "오탐이라고 생각하면 아래 버튼으로 이의제기하세요. 타임아웃 중에도 이 DM에서 이의제기할 수 있습니다."
+        )
         try:
-            await user.send(
-                f"PrettyWords 제재 기록 #{infraction_id}: 서버 규칙 위반 가능성이 감지되었습니다. "
-                f"타임아웃: {timeout_minutes}분. 사유: {reason[:250]} "
-                f"오탐이면 서버에서 `/filter report case_id:{infraction_id}` 명령으로 이의제기하세요. "
-                "봇 관리자가 승인해야 학습에 반영됩니다."
-            )
+            if guild_id:
+                await user.send(text, view=_AppealView(guild_id, infraction_id))
+            else:
+                await user.send(text)
         except discord.HTTPException:
             return
 
@@ -1409,8 +1615,9 @@ class ModerationCog(commands.Cog):
         )
         embed.add_field(name="신고자", value=f"{interaction.user.mention} {interaction.user} (`{interaction.user.id}`)", inline=False)
         embed.add_field(name="제재 기록", value=f"#{case_id}" if case_id else "없음", inline=True)
-        embed.set_footer(text="/filter resolve-report outcome:false_positive 승인 시 비속어 아님으로 학습")
-        await channel.send(embed=embed)
+        embed.set_footer(text="아래 버튼 또는 /filter resolve-report 로 처리하세요")
+        view = _ResolveReportView(interaction.guild_id, report_id)
+        await channel.send(embed=embed, view=view)
 
     @filter.command(name="resolve-report", description="신고를 처리하고 AI 학습 데이터에 반영합니다")
     @mod_only()

@@ -618,8 +618,9 @@ class ModerationStore:
     async def resolve_report(self, guild_id: int, report_id: int, resolution: str) -> sqlite3.Row | None:
         conn = self._require_conn()
         async with self._lock:
+            # status = 'open' 조건으로 이미 처리된 신고는 재처리 안 함
             row = conn.execute(
-                "SELECT * FROM reports WHERE guild_id = ? AND id = ?",
+                "SELECT * FROM reports WHERE guild_id = ? AND id = ? AND status = 'open'",
                 (guild_id, report_id),
             ).fetchone()
             if row:

@@ -231,7 +231,7 @@ class OllamaClassifier:
         try:
             result = await asyncio.to_thread(self._classify_sync, message, context)
         except Exception as exc:
-            self.last_error = f"OpenAI 요청 실패: {exc.__class__.__name__}: {exc}"
+            self.last_error = f"Ollama 요청 실패: {exc.__class__.__name__}: {exc}"
             LOGGER.exception("Ollama moderation request failed")
             return None
         if result is not None:
