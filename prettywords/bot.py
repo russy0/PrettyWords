@@ -819,6 +819,13 @@ class ModerationCog(commands.Cog):
         blocked_terms = await self._cached_blocked_terms(message.guild.id)
         allowed_terms = await self._cached_allowed_terms(message.guild.id)
 
+        # ── 허용어 사전 체크 ───────────────────────────────────────────────
+        # 메시지에 허용어가 포함되면 필터링 없이 즉시 통과합니다.
+        if allowed_terms:
+            _low = message.content.lower()
+            if any(w.lower() in _low for w in allowed_terms):
+                return
+
         _provider, _model, _scan_all = self.bot._effective_ai_settings(settings)
         classifier, batchable = self._resolve_ai_classifier(settings)
 
@@ -982,6 +989,20 @@ class ModerationCog(commands.Cog):
 
             blocked_terms = await self._cached_blocked_terms(guild_id)
             allowed_terms = await self._cached_allowed_terms(guild_id)
+
+            # 허용어 포함 메시지는 배치에서 제거 (즉시 통과)
+            if allowed_terms:
+                _allow_low = [w.lower() for w in allowed_terms]
+                _filtered_items = []
+                for _it in items:
+                    _msg_low = _it.message.content.lower()
+                    if any(w in _msg_low for w in _allow_low):
+                        LOGGER.debug("[guild:%d] allowed-term skip in batch: %.60r", guild_id, _it.message.content)
+                    else:
+                        _filtered_items.append(_it)
+                items = _filtered_items
+            if not items:
+                return
 
             # Re-resolve against the latest settings: the provider may have
             # changed, or a Groq cooldown may have just kicked in/expired.
