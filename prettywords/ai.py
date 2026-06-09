@@ -49,18 +49,31 @@ SYSTEM_PROMPT = (
     "family_insult=insults targeting family/parents, harassment=personal insults or bullying, "
     "hate=identity-based hate/discrimination, threat=threats of harm, other=policy violation not covered. "
     "Do not flag benign education, quoting for moderation, reclaimed terms, or clean jokes. "
+    "CRITICAL Korean grammar — NEVER flag as vulgar: '자지마'/'자지 마'/'자지않다' = 'don't sleep' (자다 verb + -지 마 ending, NOT a body part); '보지마'/'보지 마'/'보지않다' = 'don't look' (보다 verb + -지 마 ending, NOT a body part). If '자지' or '보지' is immediately followed by 마/않/못/말/도/도록/않아/않고/마라/마요, it is a verb form, not vulgar. "
+    "IMPORTANT: A false positive (flagging an innocent message) is worse than a false negative. "
+    "When in doubt, do NOT flag — only flag when you are genuinely confident the message is a violation. "
+    "Set confidence below the threshold if the message could plausibly be benign in context. "
     "Use custom blocked terms as strong policy, allowed terms as exceptions, and examples as learning context. "
+    "If 'prior_messages' is provided, use it as conversational context to judge the target message. "
+    "If 'guild_notes' is provided, treat it as moderator-supplied context about this community. "
     "Write the reason field in Korean. Return only JSON matching the schema. No markdown."
 )
 
 BATCH_SYSTEM_PROMPT = (
     "You are a Discord moderation classifier for Korean and English servers. "
-    "You will receive a JSON object with a 'messages' array; each entry has a unique integer 'index' "
-    "and a 'message' string. Classify EVERY message independently — never let one message's content "
-    "influence another's verdict. Detect profanity, masked profanity, insults, harassment, and demeaning "
-    "language. Use categories only from this taxonomy: profanity, sexual, family_insult, harassment, hate, "
+    "You will receive a JSON object with a 'messages' array; each entry has a unique integer 'index', "
+    "a 'message' string, and an optional 'prior_messages' array of recent channel messages for context. "
+    "Classify EVERY message independently — never let one message's verdict influence another's. "
+    "Use prior_messages only as conversational context for that entry's message. "
+    "Detect profanity, masked profanity, insults, harassment, and demeaning language. "
+    "Use categories only from this taxonomy: profanity, sexual, family_insult, harassment, hate, "
     "threat, other. Do not flag benign education, quoting for moderation, reclaimed terms, or clean jokes. "
+    "CRITICAL Korean grammar — NEVER flag as vulgar: '자지마'/'자지 마'/'자지않다' = 'don't sleep' (자다 verb + -지 마 ending, NOT a body part); '보지마'/'보지 마'/'보지않다' = 'don't look' (보다 verb + -지 마 ending, NOT a body part). If '자지' or '보지' is immediately followed by 마/않/못/말/도/도록/않아/않고/마라/마요, it is a verb form, not vulgar. "
+    "IMPORTANT: A false positive (flagging an innocent message) is worse than a false negative. "
+    "When in doubt, do NOT flag — only flag when genuinely confident the message is a violation. "
+    "Set confidence below threshold if the message could plausibly be benign in context. "
     "Use custom blocked terms as strong policy, allowed terms as exceptions, and examples as learning context. "
+    "If 'guild_notes' is provided, treat it as moderator-supplied context about this community. "
     "Write every reason field in Korean. "
     "Return only JSON matching the schema: an object with a 'decisions' array containing exactly one "
     "decision object per input message, each carrying the same 'index' as its source message so results "
@@ -120,10 +133,11 @@ class AIContext:
     confirmed_examples: list[str] = field(default_factory=list)
     false_positive_examples: list[str] = field(default_factory=list)
     auto_examples: list[str] = field(default_factory=list)
+    guild_notes: str = ""
 
 
 def _context_payload(context: AIContext) -> dict[str, object]:
-    return {
+    d: dict[str, object] = {
         "custom_blocked_terms": [
             {"term": term.term, "severity": term.severity, "category": term.category}
             for term in context.blocked_terms[:80]
@@ -133,17 +147,30 @@ def _context_payload(context: AIContext) -> dict[str, object]:
         "known_false_positive_examples": context.false_positive_examples[:8],
         "recent_auto_flagged_examples": context.auto_examples[:8],
     }
+    if context.guild_notes:
+        d["guild_notes"] = context.guild_notes[:500]
+    return d
 
 
-def _payload(message: str, context: AIContext) -> dict[str, object]:
-    return {"message": message[:1800], **_context_payload(context)}
+def _payload(message: str, context: AIContext, prior_messages: list[str] | None = None) -> dict[str, object]:
+    d: dict[str, object] = {"message": message[:1800], **_context_payload(context)}
+    if prior_messages:
+        d["prior_messages"] = [m[:300] for m in prior_messages[-10:]]
+    return d
 
 
-def _batch_payload(messages: list[str], context: AIContext) -> dict[str, object]:
-    return {
-        "messages": [{"index": index, "message": text[:1800]} for index, text in enumerate(messages)],
-        **_context_payload(context),
-    }
+def _batch_payload(
+    messages: list[str],
+    context: AIContext,
+    prior_messages: list[list[str]] | None = None,
+) -> dict[str, object]:
+    items: list[dict[str, object]] = []
+    for index, text in enumerate(messages):
+        item: dict[str, object] = {"index": index, "message": text[:1800]}
+        if prior_messages and index < len(prior_messages) and prior_messages[index]:
+            item["prior_messages"] = [m[:300] for m in prior_messages[index][-10:]]
+        items.append(item)
+    return {"messages": items, **_context_payload(context)}
 
 
 def _extract_json_object(content: str) -> dict[str, object]:
@@ -183,7 +210,7 @@ class OpenAIClassifier:
         self.model = model
         self.provider_name = "openai"
 
-    async def classify(self, message: str, context: AIContext) -> ModerationDecision | None:
+    async def classify(self, message: str, context: AIContext, prior_messages: list[str] | None = None) -> ModerationDecision | None:
         try:
             response = await self.client.chat.completions.create(
                 model=self.model,
@@ -194,7 +221,7 @@ class OpenAIClassifier:
                     },
                     {
                         "role": "user",
-                        "content": json.dumps(_payload(message, context), ensure_ascii=False),
+                        "content": json.dumps(_payload(message, context, prior_messages), ensure_ascii=False),
                     },
                 ],
                 response_format={
@@ -226,10 +253,10 @@ class OllamaClassifier:
         self.provider_name = "ollama"
         self.last_error = ""
 
-    async def classify(self, message: str, context: AIContext) -> ModerationDecision | None:
+    async def classify(self, message: str, context: AIContext, prior_messages: list[str] | None = None) -> ModerationDecision | None:
         LOGGER.debug("Ollama request: model=%s | %.80r", self.model, message)
         try:
-            result = await asyncio.to_thread(self._classify_sync, message, context)
+            result = await asyncio.to_thread(self._classify_sync, message, context, prior_messages)
         except Exception as exc:
             self.last_error = f"Ollama 요청 실패: {exc.__class__.__name__}: {exc}"
             LOGGER.exception("Ollama moderation request failed")
@@ -241,7 +268,7 @@ class OllamaClassifier:
             )
         return result
 
-    def _classify_sync(self, message: str, context: AIContext) -> ModerationDecision | None:
+    def _classify_sync(self, message: str, context: AIContext, prior_messages: list[str] | None = None) -> ModerationDecision | None:
         self.last_error = ""
         body = {
             "model": self.model,
@@ -250,7 +277,7 @@ class OllamaClassifier:
             "options": {"temperature": 0, "num_ctx": 2048},
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": json.dumps(_payload(message, context), ensure_ascii=False)},
+                {"role": "user", "content": json.dumps(_payload(message, context, prior_messages), ensure_ascii=False)},
             ],
         }
         request = urllib.request.Request(
@@ -332,8 +359,8 @@ class GroqClassifier:
         # We start optimistic and downgrade to json_object on the first 400.
         self._use_json_schema = True
 
-    async def classify(self, message: str, context: AIContext) -> ModerationDecision | None:
-        results = await self.classify_batch([message], context)
+    async def classify(self, message: str, context: AIContext, prior_messages: list[str] | None = None) -> ModerationDecision | None:
+        results = await self.classify_batch([message], context, [prior_messages or []])
         return results[0] if results else None
 
     def _attempt_order(self) -> list[int]:
@@ -357,141 +384,173 @@ class GroqClassifier:
         self._key_cooldowns[index] = None
         self._cursor = (index + 1) % self._key_count
 
-    async def classify_batch(
-        self, messages: list[str], context: AIContext
-    ) -> list[ModerationDecision | None]:
-        """Classify many messages in one request.
+    def _build_request_kwargs(self, payload: str) -> dict:
+        base = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": BATCH_SYSTEM_PROMPT},
+                {"role": "user", "content": payload},
+            ],
+        }
+        if self._use_json_schema:
+            base["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "prettywords_moderation_batch",
+                    "strict": True,
+                    "schema": BATCH_DECISION_SCHEMA,
+                },
+            }
+        else:
+            base["response_format"] = {"type": "json_object"}
+        return base
 
-        Returns a list of decisions (or None for items the model didn't return
-        a usable verdict for) aligned with the input order. If multiple Groq
-        API keys are configured, a key that gets HTTP 429'd is parked in its
-        own short cooldown and the request is retried on the next key — so a
-        single rate-limited key doesn't take the whole batch down. Only when
-        *every* configured key is currently rate limited does this raise
-        `RateLimitedError`, so the caller can fall back to a local model.
+    async def _send_sub_batch(
+        self,
+        key_index: int,
+        messages: list[str],
+        context: AIContext,
+        prior_messages: list[list[str]] | None,
+        index_offset: int,
+    ) -> tuple[list[ModerationDecision | None], float | None]:
+        """Send one chunk to a specific key. Returns (results, retry_after_or_None).
+        results is [None]*len(messages) on failure."""
+        from openai import BadRequestError, RateLimitError
+
+        payload = json.dumps(
+            _batch_payload(messages, context, prior_messages), ensure_ascii=False
+        )
+        try:
+            response = await self._clients[key_index].chat.completions.create(
+                **self._build_request_kwargs(payload)
+            )
+        except RateLimitError as exc:
+            retry_after = _retry_after_seconds(exc)
+            self._mark_rate_limited(key_index, retry_after)
+            LOGGER.warning("Groq key #%d/%d rate limited (parallel)", key_index + 1, self._key_count)
+            return [None] * len(messages), retry_after
+        except BadRequestError as exc:
+            if self._use_json_schema and "json_schema" in str(exc).lower():
+                LOGGER.warning(
+                    "Model %s does not support json_schema; switching to json_object", self.model
+                )
+                self._use_json_schema = False
+                try:
+                    response = await self._clients[key_index].chat.completions.create(
+                        **self._build_request_kwargs(payload)
+                    )
+                except Exception:
+                    LOGGER.exception("Groq sub-batch failed after json_object fallback")
+                    return [None] * len(messages), None
+            else:
+                LOGGER.error("Groq bad request on key #%d: %s", key_index + 1, exc)
+                return [None] * len(messages), None
+        except Exception:
+            LOGGER.exception("Groq sub-batch request failed (key #%d)", key_index + 1)
+            return [None] * len(messages), None
+
+        self._mark_success(key_index)
+        try:
+            content = response.choices[0].message.content or "{}"
+            raw = _extract_json_object(content).get("decisions", [])
+        except Exception:
+            LOGGER.exception("Groq sub-batch response parsing failed")
+            return [None] * len(messages), None
+
+        results: list[ModerationDecision | None] = [None] * len(messages)
+        for entry in raw:
+            try:
+                local_idx = int(entry["index"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if 0 <= local_idx < len(messages) and results[local_idx] is None:
+                try:
+                    results[local_idx] = _decision_from_data(entry, "groq")
+                except Exception:
+                    LOGGER.exception("Groq sub-batch item parse error (local_idx=%s)", local_idx)
+        return results, None
+
+    async def classify_batch(
+        self, messages: list[str], context: AIContext, prior_messages: list[list[str]] | None = None
+    ) -> list[ModerationDecision | None]:
+        """Classify messages using all available (non-rate-limited) API keys in parallel.
+
+        Messages are split evenly across ready keys and sent concurrently with
+        asyncio.gather. Failed sub-batches return None entries which the caller
+        handles via the normal fallback path. Raises RateLimitedError only when
+        every configured key is currently rate-limited.
         """
         if not messages:
             return []
 
-        from openai import BadRequestError, RateLimitError
-
         self.last_error = ""
-        payload = json.dumps(_batch_payload(messages, context), ensure_ascii=False)
+        now = datetime.now(timezone.utc)
+        ready_keys = [
+            i for i in range(self._key_count)
+            if self._key_cooldowns[i] is None or self._key_cooldowns[i] <= now
+        ]
 
-        def _build_request_kwargs() -> dict:
-            base = {
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": BATCH_SYSTEM_PROMPT},
-                    {"role": "user", "content": payload},
-                ],
-            }
-            if self._use_json_schema:
-                base["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "prettywords_moderation_batch",
-                        "strict": True,
-                        "schema": BATCH_DECISION_SCHEMA,
-                    },
-                }
-            else:
-                base["response_format"] = {"type": "json_object"}
-            return base
-
-        attempt_order = self._attempt_order()
-        ready_count = sum(
-            1 for i in attempt_order
-            if self._key_cooldowns[i] is None or self._key_cooldowns[i] <= datetime.now(timezone.utc)
-        )
-        LOGGER.debug(
-            "Groq batch request: %d messages | %d/%d keys available | model=%s | format=%s",
-            len(messages), ready_count, self._key_count, self.model,
-            "json_schema" if self._use_json_schema else "json_object",
-        )
-        rate_limited_keys = 0
-        best_retry_after: float | None = None
-        response = None
-
-        for key_index in attempt_order:
-            try:
-                response = await self._clients[key_index].chat.completions.create(
-                    **_build_request_kwargs()
-                )
-            except RateLimitError as exc:
-                retry_after = _retry_after_seconds(exc)
-                self._mark_rate_limited(key_index, retry_after)
-                rate_limited_keys += 1
-                if retry_after is not None:
-                    best_retry_after = retry_after if best_retry_after is None else min(best_retry_after, retry_after)
-                LOGGER.warning(
-                    "Groq key #%d/%d rate limited; trying next key", key_index + 1, self._key_count
-                )
-                continue
-            except BadRequestError as exc:
-                if self._use_json_schema and "json_schema" in str(exc).lower():
-                    LOGGER.warning(
-                        "Model %s does not support json_schema; switching to json_object for all future requests",
-                        self.model,
-                    )
-                    self._use_json_schema = False
-                    try:
-                        response = await self._clients[key_index].chat.completions.create(
-                            **_build_request_kwargs()
-                        )
-                    except Exception:
-                        LOGGER.exception("Groq moderation batch request failed after json_object fallback")
-                        self.last_error = "Groq 요청 실패"
-                        return [None] * len(messages)
-                    self._mark_success(key_index)
-                    break
-                LOGGER.error("Groq bad request: %s", exc)
-                self.last_error = f"Groq 잘못된 요청: {exc}"
-                return [None] * len(messages)
-            except Exception:
-                LOGGER.exception("Groq moderation batch request failed")
-                self.last_error = "Groq 요청 실패"
-                return [None] * len(messages)
-            else:
-                self._mark_success(key_index)
-                break
-
-        if response is None:
-            suffix = f" ({best_retry_after:.0f}초 후 재시도)" if best_retry_after else ""
+        if not ready_keys:
+            # 모든 키가 rate-limit 중
+            best_retry_after = min(
+                (self._key_cooldowns[i] - now).total_seconds()
+                for i in range(self._key_count)
+                if self._key_cooldowns[i] is not None
+            )
             if self._key_count > 1:
-                self.last_error = f"Groq 키 {self._key_count}개가 모두 요청 제한에 걸렸습니다{suffix}"
+                self.last_error = f"Groq 키 {self._key_count}개가 모두 요청 제한에 걸렸습니다"
             else:
-                self.last_error = f"Groq 요청 제한에 걸렸습니다{suffix}"
+                self.last_error = "Groq 요청 제한에 걸렸습니다"
             LOGGER.warning("%s", self.last_error)
             raise RateLimitedError(best_retry_after, self.last_error)
 
-        if rate_limited_keys:
-            LOGGER.info(
-                "Groq batch succeeded after rotating past %d rate-limited key(s)", rate_limited_keys
-            )
+        n_keys = len(ready_keys)
+        # 메시지를 준비된 키 수만큼 균등 분할
+        chunk_size = max(1, -(-len(messages) // n_keys))  # ceiling division
+        chunks: list[list[str]] = []
+        prior_chunks: list[list[list[str]] | None] = []
+        for start in range(0, len(messages), chunk_size):
+            end = start + chunk_size
+            chunks.append(messages[start:end])
+            prior_chunks.append(prior_messages[start:end] if prior_messages else None)
 
-        try:
-            content = response.choices[0].message.content or "{}"
-            raw_decisions = _extract_json_object(content).get("decisions", [])
-        except Exception:
-            LOGGER.exception("Groq moderation batch response parsing failed")
-            self.last_error = "Groq 응답 파싱 실패"
-            return [None] * len(messages)
+        # 실제 사용할 키: 청크 수만큼 (키가 많아도 청크 수 이상은 안 씀)
+        used_keys = ready_keys[:len(chunks)]
 
-        results: list[ModerationDecision | None] = [None] * len(messages)
-        for entry in raw_decisions:
-            try:
-                index = int(entry["index"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if 0 <= index < len(messages) and results[index] is None:
-                try:
-                    results[index] = _decision_from_data(entry, "groq")
-                except Exception:
-                    LOGGER.exception("Groq moderation batch item parsing failed (index=%s)", index)
+        LOGGER.debug(
+            "Groq parallel batch: %d messages → %d chunk(s) across %d/%d keys | model=%s",
+            len(messages), len(chunks), len(used_keys), self._key_count, self.model,
+        )
 
-        missing = sum(1 for item in results if item is None)
+        coros = [
+            self._send_sub_batch(key_idx, chunk, context, prior_chunk, i * chunk_size)
+            for i, (key_idx, chunk, prior_chunk) in enumerate(zip(used_keys, chunks, prior_chunks))
+        ]
+        sub_results = await asyncio.gather(*coros)
+
+        # 결과를 원래 순서대로 합칩니다
+        merged: list[ModerationDecision | None] = []
+        all_rate_limited = True
+        best_retry: float | None = None
+        for chunk_decisions, retry_after in sub_results:
+            merged.extend(chunk_decisions)
+            if retry_after is None:
+                all_rate_limited = False
+            elif best_retry is None or retry_after < best_retry:
+                best_retry = retry_after
+
+        # 준비된 키가 있었는데 전부 rate-limit 됐다면 예외 발생
+        if all_rate_limited and all(d is None for d in merged):
+            if self._key_count > 1:
+                self.last_error = f"Groq 키 {self._key_count}개가 모두 요청 제한에 걸렸습니다"
+            else:
+                self.last_error = "Groq 요청 제한에 걸렸습니다"
+            raise RateLimitedError(best_retry, self.last_error)
+
+        missing = sum(1 for d in merged if d is None)
         if missing:
             self.last_error = f"Groq 배치 응답에서 {missing}/{len(messages)}개 판정 누락"
             LOGGER.warning("%s", self.last_error)
-        return results
+        else:
+            LOGGER.debug("Groq parallel batch complete: %d decisions", len(merged))
+        return merged

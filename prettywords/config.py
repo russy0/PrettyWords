@@ -22,6 +22,7 @@ class BotConfig:
     openai_model: str
     ollama_base_url: str
     ollama_model: str
+    ollama_model_configured: bool  # True only when OLLAMA_MODEL env var is explicitly set
     ollama_timeout_seconds: float
     groq_api_keys: tuple[str, ...]
     groq_model: str
@@ -82,6 +83,7 @@ def load_config() -> BotConfig:
         openai_model=os.getenv("OPENAI_MODEL", "gpt-5-nano"),
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/"),
         ollama_model=os.getenv("OLLAMA_MODEL", "qwen3:4b").strip(),
+        ollama_model_configured=bool(os.getenv("OLLAMA_MODEL", "").strip()),
         ollama_timeout_seconds=float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "30")),
         groq_api_keys=_str_list_env("GROQ_API_KEY") or _str_list_env("GROQ_API_KEYS"),
         groq_model=os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct").strip(),

@@ -21,6 +21,7 @@ class GuildSettings:
     paused: bool = False
     log_channel_id: int | None = None
     health_log_channel_id: int | None = None
+    appeal_channel_id: int | None = None
     timeout_minutes: int = 10
     confidence_threshold: float = 0.78
     delete_messages: bool = True
@@ -32,6 +33,7 @@ class GuildSettings:
     ai_model: str = ""
     ai_scan_all: bool | None = None
     health_log_enabled: bool = True
+    ai_notes: str = ""
 
 
 @dataclass(slots=True)
@@ -81,6 +83,7 @@ class ModerationStore:
                     paused INTEGER NOT NULL DEFAULT 0,
                     log_channel_id INTEGER,
                     health_log_channel_id INTEGER,
+                    appeal_channel_id INTEGER,
                     timeout_minutes INTEGER NOT NULL DEFAULT 10,
                     confidence_threshold REAL NOT NULL DEFAULT 0.78,
                     delete_messages INTEGER NOT NULL DEFAULT 1,
@@ -91,7 +94,8 @@ class ModerationStore:
                     ai_provider TEXT NOT NULL DEFAULT '',
                     ai_model TEXT NOT NULL DEFAULT '',
                     ai_scan_all INTEGER,
-                    health_log_enabled INTEGER NOT NULL DEFAULT 1
+                    health_log_enabled INTEGER NOT NULL DEFAULT 1,
+                    ai_notes TEXT NOT NULL DEFAULT ''
                 );
 
                 CREATE TABLE IF NOT EXISTS disabled_channels (
@@ -201,6 +205,8 @@ class ModerationStore:
             self._ensure_column(conn, "guild_settings", "ai_model", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "guild_settings", "ai_scan_all", "INTEGER")
             self._ensure_column(conn, "guild_settings", "health_log_enabled", "INTEGER NOT NULL DEFAULT 1")
+            self._ensure_column(conn, "guild_settings", "ai_notes", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "guild_settings", "appeal_channel_id", "INTEGER")
             self._ensure_column(conn, "blocked_terms", "category", "TEXT NOT NULL DEFAULT 'profanity'")
             self._ensure_column(conn, "learning_events", "category", "TEXT NOT NULL DEFAULT ''")
             conn.commit()
@@ -213,9 +219,11 @@ class ModerationStore:
     async def get_settings(self, guild_id: int) -> GuildSettings:
         conn = self._require_conn()
         async with self._lock:
-            conn.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (guild_id,))
+            cursor = conn.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (guild_id,))
             row = conn.execute("SELECT * FROM guild_settings WHERE guild_id = ?", (guild_id,)).fetchone()
-            conn.commit()
+            # 실제로 행이 삽입된 경우에만 commit합니다.
+            if cursor.rowcount:
+                conn.commit()
         return self._settings_from_row(row)
 
     async def update_settings(self, guild_id: int, **fields: Any) -> GuildSettings:
@@ -236,12 +244,16 @@ class ModerationStore:
             "ai_model",
             "ai_scan_all",
             "health_log_enabled",
+            "ai_notes",
+            "appeal_channel_id",
         }
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"Unknown settings fields: {', '.join(sorted(unknown))}")
 
         await self.get_settings(guild_id)
+        # assignments는 위 화이트리스트에서만 오는 이름으로 구성되므로 SQL 인젝션 위험이 없습니다.
+        # 화이트리스트를 수정할 때는 반드시 이 안전성 가정을 유지해야 합니다.
         assignments = ", ".join(f"{name} = ?" for name in fields)
         values = [self._sqlite_value(value) for value in fields.values()]
         values.append(guild_id)
@@ -258,6 +270,7 @@ class ModerationStore:
             paused=bool(row["paused"]),
             log_channel_id=row["log_channel_id"],
             health_log_channel_id=row["health_log_channel_id"],
+            appeal_channel_id=row["appeal_channel_id"],
             timeout_minutes=int(row["timeout_minutes"]),
             confidence_threshold=float(row["confidence_threshold"]),
             delete_messages=bool(row["delete_messages"]),
@@ -269,6 +282,7 @@ class ModerationStore:
             ai_model=str(row["ai_model"] or ""),
             ai_scan_all=None if row["ai_scan_all"] is None else bool(row["ai_scan_all"]),
             health_log_enabled=bool(row["health_log_enabled"]),
+            ai_notes=str(row["ai_notes"] or ""),
         )
 
     def _sqlite_value(self, value: Any) -> Any:
@@ -549,7 +563,7 @@ class ModerationStore:
                     message_id,
                     user_id,
                     username,
-                    content[:1900],
+                    content[:1900],  # Discord 메시지 최대 2000자; embed 여유분을 고려해 1900자로 제한
                     normalized_hash,
                     json.dumps(decision.to_dict(), ensure_ascii=False),
                     action,

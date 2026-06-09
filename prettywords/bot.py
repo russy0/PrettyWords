@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 import discord
 from discord import app_commands
@@ -18,6 +18,7 @@ from .filtering import (
     DEFAULT_BLOCKED_TERMS,
     LocalClassifier,
     ModerationDecision,
+    ModerationTerm,
     category_label,
     compact_text,
     combine_decisions,
@@ -29,6 +30,38 @@ from .storage import GuildSettings, ModerationStore
 
 LOGGER = logging.getLogger(__name__)
 MAX_TIMEOUT_MINUTES = 28 * 24 * 60
+
+# ── 길드별 TTL 캐시 ─────────────────────────────────────────────────────────────
+# on_message 마다 동일한 DB 쿼리를 반복하지 않도록 짧은 TTL 캐시를 사용합니다.
+
+_CACHE_MISS: object = object()
+
+
+@dataclass(slots=True)
+class _CacheEntry:
+    value: Any
+    expires_at: datetime
+
+
+class _GuildCache:
+    """길드별 TTL 인메모리 캐시. settings/terms/채널 목록 등 자주 읽히는 값을 캐시합니다."""
+
+    def __init__(self) -> None:
+        self._data: dict[tuple, _CacheEntry] = {}
+
+    def get(self, key: tuple) -> Any:
+        entry = self._data.get(key)
+        if entry is None or datetime.now(timezone.utc) >= entry.expires_at:
+            return _CACHE_MISS
+        return entry.value
+
+    def put(self, key: tuple, value: Any, ttl_seconds: float) -> None:
+        self._data[key] = _CacheEntry(
+            value, datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+        )
+
+    def invalidate_guild(self, guild_id: int) -> None:
+        self._data = {k: v for k, v in self._data.items() if k[1] != guild_id}
 CATEGORY_CHOICES = [
     app_commands.Choice(name=label, value=value)
     for value, label in CATEGORY_LABELS.items()
@@ -54,6 +87,9 @@ SOURCE_LABELS = {
     "local": "로컬 필터",
     "ai": "AI",
     "local+ai": "로컬+AI",
+    "openai": "AI (OpenAI)",
+    "ollama": "AI (Ollama)",
+    "groq": "AI (Groq)",
 }
 
 
@@ -139,6 +175,7 @@ class _PendingClassification:
     settings: GuildSettings
     local: ModerationDecision
     queued_at: datetime
+    prior_messages: list[str] = field(default_factory=list)
 
 
 async def send_interaction(
@@ -174,7 +211,10 @@ class PrettyWordsBot(commands.Bot):
     def _effective_ai_settings(self, settings: GuildSettings) -> tuple[str, str, bool]:
         provider = (settings.ai_provider or self.config.ai_provider).strip().lower()
         if provider == "auto":
-            if settings.ai_model or self.config.ollama_model:
+            # settings.ai_model은 길드 전용 오버라이드이므로 ollama를 의미합니다.
+            # ollama_model_configured는 OLLAMA_MODEL 환경변수가 명시적으로 설정된 경우에만 True입니다.
+            # 기본값("qwen3:4b")만 있는 경우에는 ollama를 자동 선택하지 않습니다.
+            if settings.ai_model or self.config.ollama_model_configured:
                 provider = "ollama"
             elif self.config.openai_api_key:
                 provider = "openai"
@@ -313,33 +353,75 @@ class _AppealModal(discord.ui.Modal, title="이의제기"):
             f"이의제기가 접수됐습니다 (신고 #{report_id}). 관리자 검토 후 처리됩니다.",
             ephemeral=True,
         )
-        # 로그 채널에 신고 embed + 처리 버튼 전달
         guild = self._pw_bot.get_guild(self._guild_id)
         if guild is None:
             return
         settings = await self._pw_bot.store.get_settings(self._guild_id)
-        if not settings.log_channel_id:
+        # 이의제기 전용 채널 우선, 없으면 일반 로그 채널로 폴백
+        target_ch_id = settings.appeal_channel_id or settings.log_channel_id
+        if not target_ch_id:
             return
-        log_ch = guild.get_channel(settings.log_channel_id)
-        if not isinstance(log_ch, discord.abc.Messageable):
+        target_ch = guild.get_channel(target_ch_id)
+        if not isinstance(target_ch, discord.abc.Messageable):
             return
-        embed = discord.Embed(
-            title=f"PrettyWords 신고 #{report_id} (DM 이의제기)",
+
+        # ── 이의제기 embed ────────────────────────────────────────────────
+        appeal_embed = discord.Embed(
+            title=f"✋ 이의제기 #{report_id}",
             description=self.reason.value[:900],
-            color=discord.Color.red(),
+            color=discord.Color.orange(),
         )
-        embed.add_field(
-            name="신고자",
+        appeal_embed.add_field(
+            name="신청자",
             value=f"<@{interaction.user.id}> {interaction.user} (`{interaction.user.id}`)",
             inline=False,
         )
-        embed.add_field(name="제재 기록", value=f"#{self._infraction_id}", inline=True)
-        embed.set_footer(text="아래 버튼으로 처리하세요")
+        appeal_embed.add_field(name="제재 기록 ID", value=f"#{self._infraction_id}", inline=True)
+
+        # ── 원본 제재 기록 embed ──────────────────────────────────────────
+        infraction = await self._pw_bot.store.get_infraction(self._guild_id, self._infraction_id)
+        embeds = [appeal_embed]
+        if infraction:
+            import json as _json
+            try:
+                dec = _json.loads(infraction.decision_json)
+            except Exception:
+                dec = {}
+            inf_embed = discord.Embed(
+                title=f"📋 원본 제재 기록 #{self._infraction_id}",
+                color=discord.Color.red(),
+            )
+            inf_embed.add_field(
+                name="대상 메시지",
+                value=f"```{infraction.content[:900]}```",
+                inline=False,
+            )
+            inf_embed.add_field(
+                name="AI 판정",
+                value=(
+                    f"위반: {dec.get('violation', '?')} | "
+                    f"확신도: {dec.get('confidence', 0):.2f} | "
+                    f"심각도: {dec.get('severity', '?')}"
+                ),
+                inline=False,
+            )
+            if dec.get("categories"):
+                from .filtering import category_label as _cat_label
+                cats = ", ".join(_cat_label(c) for c in dec["categories"])
+                inf_embed.add_field(name="카테고리", value=cats, inline=True)
+            if dec.get("reason"):
+                inf_embed.add_field(name="AI 이유", value=dec["reason"][:300], inline=False)
+            ch = guild.get_channel(infraction.channel_id)
+            if ch:
+                inf_embed.add_field(name="채널", value=ch.mention, inline=True)
+            embeds.append(inf_embed)
+
         view = _ResolveReportView(self._guild_id, report_id)
+        appeal_embed.set_footer(text="아래 버튼으로 처리하세요")
         try:
-            await log_ch.send(embed=embed, view=view)
+            await target_ch.send(embeds=embeds, view=view)
         except discord.HTTPException:
-            LOGGER.exception("Failed to send DM appeal log")
+            LOGGER.exception("Failed to send appeal to channel")
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
         LOGGER.exception("AppealModal error: %s", error)
@@ -385,6 +467,7 @@ class ModerationCog(commands.Cog):
         self._stats: dict[int, dict[str, int | str]] = {}
         self._groq_queues: dict[int, list[_PendingClassification]] = {}
         self._groq_flush_locks: dict[int, asyncio.Lock] = {}
+        self._cache = _GuildCache()
 
     async def cog_load(self) -> None:
         self.health_heartbeat.start()
@@ -501,10 +584,64 @@ class ModerationCog(commands.Cog):
         except discord.HTTPException:
             LOGGER.exception("Failed to send health log")
 
-    async def _build_ai_context(self, guild_id: int, blocked_terms, allowed_terms) -> AIContext:
+    # ── 캐시 래퍼 메서드 ────────────────────────────────────────────────────────
+
+    async def _cached_settings(self, guild_id: int) -> GuildSettings:
+        key = ("settings", guild_id)
+        hit = self._cache.get(key)
+        if hit is not _CACHE_MISS:
+            return hit  # type: ignore[return-value]
+        value = await self.bot.store.get_settings(guild_id)
+        self._cache.put(key, value, ttl_seconds=5.0)
+        return value
+
+    async def _cached_blocked_terms(self, guild_id: int) -> list[ModerationTerm]:
+        key = ("blocked_terms", guild_id)
+        hit = self._cache.get(key)
+        if hit is not _CACHE_MISS:
+            return hit  # type: ignore[return-value]
+        value = await self.bot.store.list_blocked_terms(guild_id)
+        self._cache.put(key, value, ttl_seconds=30.0)
+        return value
+
+    async def _cached_allowed_terms(self, guild_id: int) -> list[str]:
+        key = ("allowed_terms", guild_id)
+        hit = self._cache.get(key)
+        if hit is not _CACHE_MISS:
+            return hit  # type: ignore[return-value]
+        value = await self.bot.store.list_allowed_terms(guild_id)
+        self._cache.put(key, value, ttl_seconds=30.0)
+        return value
+
+    async def _cached_disabled_channels(self, guild_id: int) -> list[int]:
+        key = ("disabled_channels", guild_id)
+        hit = self._cache.get(key)
+        if hit is not _CACHE_MISS:
+            return hit  # type: ignore[return-value]
+        value = await self.bot.store.list_disabled_channels(guild_id)
+        self._cache.put(key, value, ttl_seconds=10.0)
+        return value
+
+    async def _fetch_prior_messages(self, message: discord.Message) -> list[str]:
+        """AI 맥락 파악을 위해 현재 메시지 직전 최대 2개의 비봇 메시지를 가져옵니다."""
+        history: list[str] = []
+        try:
+            async for prior in message.channel.history(limit=14, before=message):
+                if prior.content and not prior.author.bot:
+                    history.append(prior.content[:300])
+                if len(history) >= 10:
+                    break
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        return list(reversed(history))
+
+    async def _build_ai_context(
+        self, guild_id: int, blocked_terms, allowed_terms, guild_notes: str = ""
+    ) -> AIContext:
         return AIContext(
             blocked_terms=blocked_terms,
             allowed_terms=allowed_terms,
+            guild_notes=guild_notes,
             confirmed_examples=await self.bot.store.learning_examples(guild_id, "confirmed_bad"),
             false_positive_examples=await self.bot.store.learning_examples(guild_id, "false_positive"),
             auto_examples=await self.bot.store.learning_examples(guild_id, "auto_flagged"),
@@ -568,6 +705,12 @@ class ModerationCog(commands.Cog):
             await interaction.response.send_message("잘못된 버튼입니다.", ephemeral=True)
             return
 
+        # 버튼의 guild_id가 현재 인터랙션 서버와 일치하는지 검증합니다.
+        # 다른 서버의 유저가 버튼을 누르는 것을 방지합니다.
+        if guild_id != interaction.guild_id:
+            await interaction.response.send_message("잘못된 버튼입니다.", ephemeral=True)
+            return
+
         # DB 작업 전에 defer — 3초 응답 제한 초과 방지
         await interaction.response.defer(ephemeral=True)
 
@@ -628,11 +771,12 @@ class ModerationCog(commands.Cog):
             return
 
         self._bump(message.guild.id, "seen")
-        settings = await self.bot.store.get_settings(message.guild.id)
+        settings = await self._cached_settings(message.guild.id)
         if settings.paused:
             self._bump(message.guild.id, "skipped")
             return
-        if await self.bot.store.is_channel_disabled(message.guild.id, message.channel.id):
+        disabled_channels = await self._cached_disabled_channels(message.guild.id)
+        if message.channel.id in disabled_channels:
             self._bump(message.guild.id, "skipped")
             return
 
@@ -657,22 +801,15 @@ class ModerationCog(commands.Cog):
             message.content,
         )
 
-        blocked_terms = await self.bot.store.list_blocked_terms(message.guild.id)
-        allowed_terms = await self.bot.store.list_allowed_terms(message.guild.id)
-        scan_content = self._mask_member_names(message)
-        local = self.bot.local_classifier.classify(scan_content, blocked_terms, allowed_terms)
+        blocked_terms = await self._cached_blocked_terms(message.guild.id)
+        allowed_terms = await self._cached_allowed_terms(message.guild.id)
 
-        LOGGER.debug(
-            "[%s] local: violation=%s conf=%.2f matched=%s",
-            message.guild.name,
-            local.violation,
-            local.confidence,
-            list(local.matched_terms) or "[]",
-        )
+        # 로컬 키워드 필터 없음: AI가 맥락 기반으로 모든 메시지를 직접 판단합니다.
+        local = ModerationDecision(violation=False, confidence=0.0, severity=0, source="local", reason="로컬 필터 비활성")
 
-        _provider, _model, scan_all = self.bot._effective_ai_settings(settings)
+        _provider, _model, _scan_all = self.bot._effective_ai_settings(settings)
         classifier, batchable = self._resolve_ai_classifier(settings)
-        should_call_ai = bool(settings.ai_enabled and classifier is not None and (scan_all or local.violation))
+        should_call_ai = bool(settings.ai_enabled and classifier is not None)
 
         LOGGER.debug(
             "[%s] AI: provider=%s batchable=%s should_call=%s ai_enabled=%s",
@@ -683,11 +820,16 @@ class ModerationCog(commands.Cog):
             settings.ai_enabled,
         )
 
+        # 대화 맥락: AI 호출 예정인 경우에만 직전 메시지를 가져옵니다.
+        prior_messages: list[str] = []
+        if should_call_ai:
+            prior_messages = await self._fetch_prior_messages(message)
+
         if should_call_ai and batchable:
             # Groq is active: queue this message and let it ride out in a batch
             # instead of spending a request per message. _finish_moderation runs
             # later, once the batch comes back.
-            await self._queue_for_batch(message, settings, local)
+            await self._queue_for_batch(message, settings, local, prior_messages)
             return
 
         ai_decision = None
@@ -704,8 +846,10 @@ class ModerationCog(commands.Cog):
                 getattr(message.channel, "name", message.channel.id),
                 message.content,
             )
-            context = await self._build_ai_context(message.guild.id, blocked_terms, allowed_terms)
-            ai_decision = await classifier.classify(message.content, context)
+            context = await self._build_ai_context(
+                message.guild.id, blocked_terms, allowed_terms, guild_notes=settings.ai_notes
+            )
+            ai_decision = await classifier.classify(message.content, context, prior_messages)
             if ai_decision is None:
                 ai_error = getattr(classifier, "last_error", "") or "AI returned no decision"
                 LOGGER.warning("[%s] AI failure (%s): %s", message.guild.name, provider_name, ai_error)
@@ -726,19 +870,33 @@ class ModerationCog(commands.Cog):
             self._bump(message.guild.id, "ai_failures")
             self._set_last_error(message.guild.id, ai_error)
 
-        decision = combine_decisions(local, ai_decision, settings.confidence_threshold)
+        # 반복 위반자 동적 임계값: AI 위반 판정인 경우에만 이력 조회
+        if ai_decision is not None and ai_decision.violation:
+            _recent = await self.bot.store.count_recent_infractions(message.guild.id, message.author.id)
+        else:
+            _recent = 0
+        _t_adj = (-0.05 if _recent >= 2 else 0.0) + (-0.05 if _recent >= 4 else 0.0)
+        _thresh = max(0.50, settings.confidence_threshold + _t_adj)
+
+        decision = combine_decisions(local, ai_decision, _thresh)
         LOGGER.debug(
-            "[%s] combined: source=%s violation=%s conf=%.2f threshold=%.2f",
+            "[%s] combined: source=%s violation=%s conf=%.2f threshold=%.2f (adj=%.2f recent=%d)",
             message.guild.name,
             decision.source,
             decision.violation,
             decision.confidence,
-            settings.confidence_threshold,
+            _thresh,
+            _t_adj,
+            _recent,
         )
-        await self._finish_moderation(message, decision, settings)
+        await self._finish_moderation(message, decision, settings, _recent=_recent)
 
     async def _queue_for_batch(
-        self, message: discord.Message, settings: GuildSettings, local: ModerationDecision
+        self,
+        message: discord.Message,
+        settings: GuildSettings,
+        local: ModerationDecision,
+        prior_messages: list[str] | None = None,
     ) -> None:
         queue = self._groq_queues.setdefault(message.guild.id, [])
         queue.append(
@@ -747,6 +905,7 @@ class ModerationCog(commands.Cog):
                 settings=settings,
                 local=local,
                 queued_at=datetime.now(timezone.utc),
+                prior_messages=prior_messages or [],
             )
         )
         LOGGER.debug(
@@ -783,15 +942,17 @@ class ModerationCog(commands.Cog):
             if not items:
                 return
 
-            blocked_terms = await self.bot.store.list_blocked_terms(guild_id)
-            allowed_terms = await self.bot.store.list_allowed_terms(guild_id)
-            context = await self._build_ai_context(guild_id, blocked_terms, allowed_terms)
+            blocked_terms = await self._cached_blocked_terms(guild_id)
+            allowed_terms = await self._cached_allowed_terms(guild_id)
 
             # Re-resolve against the latest settings: the provider may have
             # changed, or a Groq cooldown may have just kicked in/expired.
-            current_settings = await self.bot.store.get_settings(guild_id)
+            current_settings = await self._cached_settings(guild_id)
             classifier, batchable = self._resolve_ai_classifier(current_settings)
             provider_name = getattr(classifier, "provider_name", "none") if classifier else "none"
+            context = await self._build_ai_context(
+                guild_id, blocked_terms, allowed_terms, guild_notes=current_settings.ai_notes
+            )
 
             LOGGER.info(
                 "[guild:%d] flushing batch: %d messages | provider=%s batchable=%s force=%s",
@@ -804,8 +965,9 @@ class ModerationCog(commands.Cog):
 
             if classifier is not None and batchable:
                 try:
+                    batch_prior_messages = [item.prior_messages for item in items]
                     decisions = await classifier.classify_batch(
-                        [item.message.content for item in items], context
+                        [item.message.content for item in items], context, batch_prior_messages
                     )
                 except RateLimitedError as exc:
                     LOGGER.warning(
@@ -830,8 +992,16 @@ class ModerationCog(commands.Cog):
             # just entered a cooldown and fell back to Ollama. Process one by one.
             LOGGER.debug("[guild:%d] batch falling back to one-by-one via %s", guild_id, provider_name)
             for item in items:
-                ai_decision = await classifier.classify(item.message.content, context) if classifier else None
+                ai_decision = (
+                    await classifier.classify(item.message.content, context, item.prior_messages)
+                    if classifier else None
+                )
                 await self._complete_classification(item, ai_decision, classifier)
+
+        # 큐가 비어 있으면 Lock 객체도 제거해 메모리 누수를 방지합니다.
+        if not self._groq_queues.get(guild_id):
+            self._groq_queues.pop(guild_id, None)
+            self._groq_flush_locks.pop(guild_id, None)
 
     async def _finish_batch_with_fallback(
         self, items: list[_PendingClassification], context: AIContext
@@ -846,7 +1016,7 @@ class ModerationCog(commands.Cog):
             ai_decision = None
             if fallback is not None:
                 try:
-                    ai_decision = await fallback.classify(item.message.content, context)
+                    ai_decision = await fallback.classify(item.message.content, context, item.prior_messages)
                 except Exception:
                     LOGGER.exception("Groq cooldown fallback classification failed")
             await self._complete_classification(item, ai_decision, fallback)
@@ -887,38 +1057,54 @@ class ModerationCog(commands.Cog):
                     ai_decision.reason,
                 )
 
-        decision = combine_decisions(item.local, ai_decision, item.settings.confidence_threshold)
+        # 반복 위반자 동적 임계값: AI 위반 판정인 경우에만 이력 조회
+        if ai_decision is not None and ai_decision.violation:
+            _recent = await self.bot.store.count_recent_infractions(guild_id, item.message.author.id)
+        else:
+            _recent = 0
+        _t_adj = (-0.05 if _recent >= 2 else 0.0) + (-0.05 if _recent >= 4 else 0.0)
+        _thresh = max(0.50, item.settings.confidence_threshold + _t_adj)
+
+        decision = combine_decisions(item.local, ai_decision, _thresh)
         LOGGER.debug(
-            "[guild:%d] combined: source=%s violation=%s conf=%.2f",
+            "[guild:%d] combined: source=%s violation=%s conf=%.2f threshold=%.2f (adj=%.2f recent=%d)",
             guild_id,
             decision.source,
             decision.violation,
             decision.confidence,
+            _thresh,
+            _t_adj,
+            _recent,
         )
-        await self._finish_moderation(item.message, decision, item.settings)
+        await self._finish_moderation(item.message, decision, item.settings, _recent=_recent)
 
     async def _finish_moderation(
         self,
         message: discord.Message,
         decision: ModerationDecision,
         settings: GuildSettings,
+        _recent: int = -1,
     ) -> None:
-        if not decision.violation or decision.confidence < settings.confidence_threshold:
+        if not decision.violation:
             LOGGER.debug(
-                "[%s] pass: source=%s violation=%s conf=%.2f threshold=%.2f | %s | %.60r",
+                "[%s] pass (no violation): source=%s conf=%.2f | %s | %.60r",
                 message.guild.name,
                 decision.source,
-                decision.violation,
                 decision.confidence,
-                settings.confidence_threshold,
                 message.author,
                 message.content,
             )
             return
 
+        # 호출자에서 미리 조회한 경우 재사용, 아니면 직접 조회합니다.
+        # (동적 임계값은 이미 combine_decisions 호출 전에 적용됨)
+        recent = (
+            _recent if _recent >= 0
+            else await self.bot.store.count_recent_infractions(message.guild.id, message.author.id)
+        )
+
         fingerprint = message_fingerprint(message.content)
         self._bump(message.guild.id, "violations")
-        recent = await self.bot.store.count_recent_infractions(message.guild.id, message.author.id)
         timeout_minutes = self._effective_timeout(settings, recent)
         action_parts: list[str] = []
 
@@ -1047,9 +1233,26 @@ class ModerationCog(commands.Cog):
         added: list[str] = []
         for raw in decision.matched_terms:
             term = raw.strip()
-            # 2음절 이하 단어는 자동 등록 안 함 — 한국어는 짧은 단어가
-            # 동사 어간·어미에 묻혀 오탐이 너무 많음 (예: "자지" → "자지마").
-            if not term or len(term) < 3:
+            # ── 유효성 검사 ────────────────────────────────────────────────────
+            # 1) 공백 포함: AI가 reason 문장이나 구절을 matched_terms에 넣는 경우 차단
+            if " " in term or "." in term:
+                LOGGER.debug("[guild:%d] auto-register skip (contains space/period): %r", guild_id, term)
+                continue
+            # 2) 너무 긴 문자열: 단어가 아닌 문장이 들어온 경우 차단 (최대 20자)
+            if len(term) > 20:
+                LOGGER.debug("[guild:%d] auto-register skip (too long): %r", guild_id, term)
+                continue
+            # 3) 2음절 이하 단어는 자동 등록 안 함 — 한국어는 짧은 단어가
+            #    동사 어간·어미에 묻혀 오탐이 너무 많음 (예: "자지" → "자지마").
+            #    단, 한글 자모만으로 이루어진 표현(ㅅㅂ, ㅂㅅ 등)은 길이 무관 등록 허용.
+            _is_jamo_only = bool(term) and all('\u3130' <= ch <= '\u318f' for ch in term)
+            if not term or (len(term) < 3 and not _is_jamo_only):
+                continue
+            # 4) 카테고리명·메타 텍스트 차단 (AI가 카테고리를 그대로 matched_terms에 넣는 경우)
+            _meta_terms = {"profanity", "sexual", "family_insult", "harassment", "hate", "threat",
+                           "other", "욕설", "패드립", "성적발언", "괴롭힘", "혐오", "위협", "욕설 사용"}
+            if term.lower() in _meta_terms:
+                LOGGER.debug("[guild:%d] auto-register skip (meta/category name): %r", guild_id, term)
                 continue
             if term.lower() in default_terms or term.lower() in existing:
                 continue
@@ -1119,7 +1322,7 @@ class ModerationCog(commands.Cog):
         self,
         message: discord.Message,
         infraction_id: int,
-        decision,
+        decision: ModerationDecision,
         action: str,
         timeout_minutes: int,
         settings: GuildSettings,
@@ -1230,7 +1433,30 @@ class ModerationCog(commands.Cog):
         embed.add_field(name="서버 금지어", value=str(len(blocked)), inline=True)
         embed.add_field(name="허용어", value=str(len(allowed)), inline=True)
         embed.add_field(name="설정 관리자", value=str(len(config_admins)), inline=True)
+        if settings.appeal_channel_id:
+            appeal_ch = interaction.guild.get_channel(settings.appeal_channel_id)
+            embed.add_field(name="이의제기 채널", value=appeal_ch.mention if appeal_ch else f"<#{settings.appeal_channel_id}>", inline=False)
+        if settings.ai_notes:
+            embed.add_field(name="AI 메모", value=settings.ai_notes[:500], inline=False)
         await send_interaction(interaction, embed=embed)
+
+    @filter.command(name="ai-note", description="AI에게 서버 특성을 알려주는 메모를 설정합니다")
+    @mod_only()
+    @app_commands.describe(note="서버 특성 메모 (예: '게임 서버입니다. PvP 표현은 욕설이 아닌 경우가 많습니다.')  비워두면 삭제.")
+    async def ai_note(self, interaction: discord.Interaction, note: Optional[str] = None) -> None:
+        note_text = (note or "").strip()
+        await self.bot.store.update_settings(interaction.guild_id, ai_notes=note_text)
+        self._cache.invalidate_guild(interaction.guild_id)
+        if note_text:
+            await send_interaction(interaction, f"AI 메모 설정됨:\n> {note_text[:500]}")
+        else:
+            await send_interaction(interaction, "AI 메모 삭제됨")
+        await self._log_admin_event(
+            interaction.guild,
+            "AI 메모 변경",
+            f"{interaction.user}님이 AI 메모를 {'설정' if note_text else '삭제'}했습니다."
+            + (f"\n> {note_text[:200]}" if note_text else ""),
+        )
 
     @admin.command(name="config-admin-add", description="PrettyWords 설정 가능 관리자 ID를 추가합니다")
     @mod_only()
@@ -1281,19 +1507,35 @@ class ModerationCog(commands.Cog):
             lines.append(".env: " + ", ".join(f"`{admin_id}`" for admin_id in global_admins))
         await send_interaction(interaction, "\n".join(lines) if lines else "설정 관리자 ID 없음")
 
-    @filter.command(name="log-channel", description="제재/신고 로그 채널을 설정합니다")
+    @filter.command(name="set-channel", description="로그/상태/이의제기 채널을 설정합니다")
     @mod_only()
-    async def log_channel(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
-        settings = await self.bot.store.update_settings(interaction.guild_id, log_channel_id=channel.id)
-        await send_interaction(interaction, f"로그 채널 설정됨: {channel.mention}")
-        await self._log_admin_event(interaction.guild, "로그 채널 변경", f"{interaction.user}님이 로그 채널을 {channel.mention}로 설정했습니다.")
-
-    @filter.command(name="health-log-channel", description="상태 로그 전용 채널을 설정합니다")
-    @mod_only()
-    async def health_log_channel(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
-        settings = await self.bot.store.update_settings(interaction.guild_id, health_log_channel_id=channel.id)
-        await send_interaction(interaction, f"상태 로그 채널 설정됨: {channel.mention}")
-        await self._send_health_log(interaction.guild, settings, title="PrettyWords 상태 로그 채널 연결됨")
+    @app_commands.describe(
+        channel_type="채널 종류: log=제재로그, health=상태로그, appeal=이의제기",
+        channel="대상 채널",
+    )
+    @app_commands.choices(channel_type=[
+        app_commands.Choice(name="log — 제재/신고 로그", value="log"),
+        app_commands.Choice(name="health — 상태 로그", value="health"),
+        app_commands.Choice(name="appeal — 이의제기", value="appeal"),
+    ])
+    async def set_channel(self, interaction: discord.Interaction, channel_type: str, channel: discord.TextChannel) -> None:
+        if channel_type == "log":
+            settings = await self.bot.store.update_settings(interaction.guild_id, log_channel_id=channel.id)
+            self._cache.invalidate_guild(interaction.guild_id)
+            await send_interaction(interaction, f"제재/신고 로그 채널 설정됨: {channel.mention}")
+            await self._log_admin_event(interaction.guild, "로그 채널 변경", f"{interaction.user}님이 로그 채널을 {channel.mention}로 설정했습니다.")
+        elif channel_type == "health":
+            settings = await self.bot.store.update_settings(interaction.guild_id, health_log_channel_id=channel.id)
+            self._cache.invalidate_guild(interaction.guild_id)
+            await send_interaction(interaction, f"상태 로그 채널 설정됨: {channel.mention}")
+            await self._send_health_log(interaction.guild, settings, title="PrettyWords 상태 로그 채널 연결됨")
+        elif channel_type == "appeal":
+            await self.bot.store.update_settings(interaction.guild_id, appeal_channel_id=channel.id)
+            self._cache.invalidate_guild(interaction.guild_id)
+            await send_interaction(interaction, f"이의제기 채널 설정됨: {channel.mention}")
+            await self._log_admin_event(interaction.guild, "이의제기 채널 변경", f"{interaction.user}님이 이의제기 채널을 {channel.mention}로 설정했습니다.")
+        else:
+            await send_interaction(interaction, "알 수 없는 채널 종류입니다.")
 
     @filter.command(name="health", description="현재 PrettyWords 상태를 로그 채널로 보냅니다")
     @mod_only()
@@ -1309,6 +1551,7 @@ class ModerationCog(commands.Cog):
     @mod_only()
     async def health_log(self, interaction: discord.Interaction, enabled: bool) -> None:
         settings = await self.bot.store.update_settings(interaction.guild_id, health_log_enabled=enabled)
+        self._cache.invalidate_guild(interaction.guild_id)
         await send_interaction(interaction, f"상태 로그: {_enabled_label(enabled)}")
         if enabled and (settings.health_log_channel_id or settings.log_channel_id):
             await self._send_health_log(interaction.guild, settings, title="PrettyWords 상태 로그 켜짐")
@@ -1318,6 +1561,7 @@ class ModerationCog(commands.Cog):
     @app_commands.describe(minutes="0이면 타임아웃 없이 삭제/로그만 합니다")
     async def timeout(self, interaction: discord.Interaction, minutes: app_commands.Range[int, 0, MAX_TIMEOUT_MINUTES]) -> None:
         await self.bot.store.update_settings(interaction.guild_id, timeout_minutes=int(minutes))
+        self._cache.invalidate_guild(interaction.guild_id)
         await send_interaction(interaction, f"타임아웃 기본값: {minutes}분")
         await self._log_admin_event(interaction.guild, "타임아웃 변경", f"{interaction.user}님이 기본 타임아웃을 {minutes}분으로 설정했습니다.")
 
@@ -1325,6 +1569,7 @@ class ModerationCog(commands.Cog):
     @mod_only()
     async def threshold(self, interaction: discord.Interaction, confidence: app_commands.Range[float, 0.1, 0.99]) -> None:
         await self.bot.store.update_settings(interaction.guild_id, confidence_threshold=float(confidence))
+        self._cache.invalidate_guild(interaction.guild_id)
         await send_interaction(interaction, f"확신도 기준: {confidence:.2f}")
 
     @filter.command(name="mode", description="삭제/DM/모의 실행/AI/반복 위반 가중 설정을 바꿉니다")
@@ -1350,6 +1595,7 @@ class ModerationCog(commands.Cog):
             if value is not None
         }
         settings = await self.bot.store.update_settings(interaction.guild_id, **updates)
+        self._cache.invalidate_guild(interaction.guild_id)
         await send_interaction(
             interaction,
             (
@@ -1392,6 +1638,7 @@ class ModerationCog(commands.Cog):
             updates["ai_scan_all"] = scan_all
 
         settings = await self.bot.store.update_settings(interaction.guild_id, **updates)
+        self._cache.invalidate_guild(interaction.guild_id)
         _provider, _model, effective_scan_all = self.bot._effective_ai_settings(settings)
         await send_interaction(
             interaction,
@@ -1407,6 +1654,7 @@ class ModerationCog(commands.Cog):
             ai_model="",
             ai_scan_all=None,
         )
+        self._cache.invalidate_guild(interaction.guild_id)
         _provider, _model, effective_scan_all = self.bot._effective_ai_settings(settings)
         await send_interaction(
             interaction,
@@ -1417,6 +1665,7 @@ class ModerationCog(commands.Cog):
     @mod_only()
     async def pause(self, interaction: discord.Interaction, reason: Optional[str] = None) -> None:
         await self.bot.store.update_settings(interaction.guild_id, paused=True)
+        self._cache.invalidate_guild(interaction.guild_id)
         await send_interaction(interaction, "필터 일시정지됨")
         await self._log_admin_event(interaction.guild, "필터 일시정지", f"{interaction.user}: {reason or '사유 없음'}")
 
@@ -1424,20 +1673,23 @@ class ModerationCog(commands.Cog):
     @mod_only()
     async def resume(self, interaction: discord.Interaction) -> None:
         await self.bot.store.update_settings(interaction.guild_id, paused=False)
+        self._cache.invalidate_guild(interaction.guild_id)
         await send_interaction(interaction, "필터 다시 시작됨")
         await self._log_admin_event(interaction.guild, "필터 다시 시작", f"{interaction.user}님이 필터를 다시 시작했습니다.")
 
-    @filter.command(name="disable-channel", description="특정 채널에서 필터를 끕니다")
+    @filter.command(name="channel", description="특정 채널에서 필터를 켜거나 끕니다")
     @mod_only()
-    async def disable_channel(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
-        await self.bot.store.set_channel_disabled(interaction.guild_id, channel.id, interaction.user.id, True)
-        await send_interaction(interaction, f"비활성화됨: {channel.mention}")
-
-    @filter.command(name="enable-channel", description="특정 채널에서 필터를 켭니다")
-    @mod_only()
-    async def enable_channel(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
-        await self.bot.store.set_channel_disabled(interaction.guild_id, channel.id, interaction.user.id, False)
-        await send_interaction(interaction, f"활성화됨: {channel.mention}")
+    @app_commands.describe(channel="대상 채널", enabled="True=필터 켜기, False=필터 끄기")
+    async def set_channel(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel,
+        enabled: bool,
+    ) -> None:
+        await self.bot.store.set_channel_disabled(interaction.guild_id, channel.id, interaction.user.id, not enabled)
+        self._cache.invalidate_guild(interaction.guild_id)
+        label = "활성화됨" if enabled else "비활성화됨"
+        await send_interaction(interaction, f"{label}: {channel.mention}")
 
     @filter.command(name="add-word", description="서버 전용 비속어/금지어를 등록합니다")
     @mod_only()
@@ -1468,6 +1720,7 @@ class ModerationCog(commands.Cog):
             category=normalized_category,
             created_by=interaction.user.id,
         )
+        self._cache.invalidate_guild(interaction.guild_id)
         await send_interaction(
             interaction,
             f"등록됨: `{term}` 카테고리={category_label(normalized_category)} 심각도={severity}",
@@ -1477,6 +1730,7 @@ class ModerationCog(commands.Cog):
     @mod_only()
     async def remove_word(self, interaction: discord.Interaction, term: str) -> None:
         count = await self.bot.store.remove_blocked_term(interaction.guild_id, term)
+        self._cache.invalidate_guild(interaction.guild_id)
         await send_interaction(interaction, "제거됨" if count else "등록된 항목 없음")
 
     @filter.command(name="learn-message", description="메시지 ID와 욕설 구간을 카테고리 학습 데이터로 등록합니다")
@@ -1543,6 +1797,7 @@ class ModerationCog(commands.Cog):
             created_by=interaction.user.id,
         )
 
+        self._cache.invalidate_guild(interaction.guild_id)
         note = "" if term_found else "\n주의: 등록 표현이 메시지에 정확히 포함되지는 않음. 우회표현이면 정상일 수 있음."
         await interaction.followup.send(
             (
@@ -1564,12 +1819,14 @@ class ModerationCog(commands.Cog):
     @mod_only()
     async def allow_word(self, interaction: discord.Interaction, term: str) -> None:
         await self.bot.store.add_allowed_term(interaction.guild_id, term, interaction.user.id)
+        self._cache.invalidate_guild(interaction.guild_id)
         await send_interaction(interaction, f"허용됨: `{term}`")
 
     @filter.command(name="remove-allow", description="허용어/문구를 제거합니다")
     @mod_only()
     async def remove_allow(self, interaction: discord.Interaction, term: str) -> None:
         count = await self.bot.store.remove_allowed_term(interaction.guild_id, term)
+        self._cache.invalidate_guild(interaction.guild_id)
         await send_interaction(interaction, "제거됨" if count else "등록된 항목 없음")
 
     @filter.command(name="report", description="부적절한 제재/오탐을 신고합니다")
@@ -1603,21 +1860,55 @@ class ModerationCog(commands.Cog):
         reason: str,
     ) -> None:
         settings = await self.bot.store.get_settings(interaction.guild_id)
-        if not settings.log_channel_id:
+        target_ch_id = settings.appeal_channel_id or settings.log_channel_id
+        if not target_ch_id:
             return
-        channel = interaction.guild.get_channel(settings.log_channel_id)
+        channel = interaction.guild.get_channel(target_ch_id)
         if not isinstance(channel, discord.abc.Messageable):
             return
-        embed = discord.Embed(
-            title=f"PrettyWords 신고 #{report_id}",
+        appeal_embed = discord.Embed(
+            title=f"✋ 이의제기 #{report_id}",
             description=reason[:900],
-            color=discord.Color.red(),
+            color=discord.Color.orange(),
         )
-        embed.add_field(name="신고자", value=f"{interaction.user.mention} {interaction.user} (`{interaction.user.id}`)", inline=False)
-        embed.add_field(name="제재 기록", value=f"#{case_id}" if case_id else "없음", inline=True)
-        embed.set_footer(text="아래 버튼 또는 /filter resolve-report 로 처리하세요")
+        appeal_embed.add_field(name="신청자", value=f"{interaction.user.mention} {interaction.user} (`{interaction.user.id}`)", inline=False)
+        embeds = [appeal_embed]
+        if case_id:
+            appeal_embed.add_field(name="제재 기록 ID", value=f"#{case_id}", inline=True)
+            infraction = await self.bot.store.get_infraction(interaction.guild_id, case_id)
+            if infraction:
+                import json as _json
+                try:
+                    dec = _json.loads(infraction.decision_json)
+                except Exception:
+                    dec = {}
+                inf_embed = discord.Embed(
+                    title=f"📋 원본 제재 기록 #{case_id}",
+                    color=discord.Color.red(),
+                )
+                inf_embed.add_field(name="대상 메시지", value=f"```{infraction.content[:900]}```", inline=False)
+                inf_embed.add_field(
+                    name="AI 판정",
+                    value=(
+                        f"위반: {dec.get('violation', '?')} | "
+                        f"확신도: {dec.get('confidence', 0):.2f} | "
+                        f"심각도: {dec.get('severity', '?')}"
+                    ),
+                    inline=False,
+                )
+                if dec.get("categories"):
+                    from .filtering import category_label as _cat_label
+                    cats = ", ".join(_cat_label(c) for c in dec["categories"])
+                    inf_embed.add_field(name="카테고리", value=cats, inline=True)
+                if dec.get("reason"):
+                    inf_embed.add_field(name="AI 이유", value=dec["reason"][:300], inline=False)
+                ch = interaction.guild.get_channel(infraction.channel_id)
+                if ch:
+                    inf_embed.add_field(name="채널", value=ch.mention, inline=True)
+                embeds.append(inf_embed)
+        appeal_embed.set_footer(text="아래 버튼 또는 /filter resolve-report 로 처리하세요")
         view = _ResolveReportView(interaction.guild_id, report_id)
-        await channel.send(embed=embed, view=view)
+        await channel.send(embeds=embeds, view=view)
 
     @filter.command(name="resolve-report", description="신고를 처리하고 AI 학습 데이터에 반영합니다")
     @mod_only()
