@@ -176,6 +176,7 @@ class _PendingClassification:
     local: ModerationDecision
     queued_at: datetime
     prior_messages: list[str] = field(default_factory=list)
+    matched_terms: list | None = None
 
 
 async def send_interaction(
@@ -456,6 +457,20 @@ class _ResolveReportView(discord.ui.View):
                 style=style,
                 custom_id=f"pw_resolve:{guild_id}:{report_id}:{outcome}",
             ))
+
+
+
+def _fast_term_match(text: str, terms: list) -> list:
+    """메시지에 포함된 금지어를 빠르게 찾습니다. O(n*k) 단순 포함 탐색."""
+    low = text.lower()
+    matched = []
+    seen: set[str] = set()
+    for t in terms:
+        w = t.term.lower()
+        if w not in seen and w in low:
+            matched.append(t)
+            seen.add(w)
+    return matched
 
 
 class ModerationCog(commands.Cog):
@@ -804,11 +819,29 @@ class ModerationCog(commands.Cog):
         blocked_terms = await self._cached_blocked_terms(message.guild.id)
         allowed_terms = await self._cached_allowed_terms(message.guild.id)
 
-        # 로컬 키워드 필터 없음: AI가 맥락 기반으로 모든 메시지를 직접 판단합니다.
-        local = ModerationDecision(violation=False, confidence=0.0, severity=0, source="local", reason="로컬 필터 비활성")
-
         _provider, _model, _scan_all = self.bot._effective_ai_settings(settings)
         classifier, batchable = self._resolve_ai_classifier(settings)
+
+        # ── 금지어 사전 매칭 ───────────────────────────────────────────────
+        # 관리자가 직접 등록한 단어가 포함된 경우 local=violation으로 처리합니다.
+        # AI가 맥락상 오탐으로 판단하면 combine_decisions에서 번복됩니다.
+        _matched_terms = _fast_term_match(message.content, blocked_terms) if blocked_terms else []
+        if _matched_terms:
+            _top = _matched_terms[0]
+            from .filtering import category_label as _cat_label
+            local = ModerationDecision(
+                violation=True,
+                confidence=0.95,
+                severity=_top.severity,
+                categories=tuple(dict.fromkeys(t.category for t in _matched_terms)),
+                matched_terms=tuple(t.term for t in _matched_terms),
+                reason=f"등록된 금지어 포함: {', '.join(t.term for t in _matched_terms[:5])}",
+                source="local",
+                suggested_action="timeout",
+            )
+        else:
+            local = ModerationDecision(violation=False, confidence=0.0, severity=0, source="local", reason="금지어 없음")
+
         should_call_ai = bool(settings.ai_enabled and classifier is not None)
 
         LOGGER.debug(
@@ -826,10 +859,10 @@ class ModerationCog(commands.Cog):
             prior_messages = await self._fetch_prior_messages(message)
 
         if should_call_ai and batchable:
-            # Groq is active: queue this message and let it ride out in a batch
-            # instead of spending a request per message. _finish_moderation runs
-            # later, once the batch comes back.
-            await self._queue_for_batch(message, settings, local, prior_messages)
+            await self._queue_for_batch(
+                message, settings, local, prior_messages,
+                matched_terms=_matched_terms if _matched_terms else None,
+            )
             return
 
         ai_decision = None
@@ -847,7 +880,10 @@ class ModerationCog(commands.Cog):
                 message.content,
             )
             context = await self._build_ai_context(
-                message.guild.id, blocked_terms, allowed_terms, guild_notes=settings.ai_notes
+                message.guild.id,
+                _matched_terms if _matched_terms else blocked_terms,
+                allowed_terms,
+                guild_notes=settings.ai_notes,
             )
             ai_decision = await classifier.classify(message.content, context, prior_messages)
             if ai_decision is None:
@@ -897,6 +933,7 @@ class ModerationCog(commands.Cog):
         settings: GuildSettings,
         local: ModerationDecision,
         prior_messages: list[str] | None = None,
+        matched_terms: list | None = None,
     ) -> None:
         queue = self._groq_queues.setdefault(message.guild.id, [])
         queue.append(
@@ -906,6 +943,7 @@ class ModerationCog(commands.Cog):
                 local=local,
                 queued_at=datetime.now(timezone.utc),
                 prior_messages=prior_messages or [],
+                matched_terms=matched_terms,
             )
         )
         LOGGER.debug(
@@ -950,6 +988,8 @@ class ModerationCog(commands.Cog):
             current_settings = await self._cached_settings(guild_id)
             classifier, batchable = self._resolve_ai_classifier(current_settings)
             provider_name = getattr(classifier, "provider_name", "none") if classifier else "none"
+            # 각 메시지마다 matched_terms가 다를 수 있으므로 배치 레벨에서는
+            # 전체 blocked_terms를 컨텍스트로 사용합니다 (이미 80개 상한 적용).
             context = await self._build_ai_context(
                 guild_id, blocked_terms, allowed_terms, guild_notes=current_settings.ai_notes
             )
